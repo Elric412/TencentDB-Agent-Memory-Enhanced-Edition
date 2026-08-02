@@ -21,6 +21,7 @@ import {
   isToolUseInAssistant,
   extractToolUseIdFromAssistant,
   replaceWithSummary,
+  restoreMessageSnapshot,
   replaceAssistantToolUseWithSummary,
   compressNonCurrentToolUseBlocks,
   getCurrentTaskNodeIds,
@@ -288,7 +289,7 @@ export function createLlmInputL3Handler(
         logger.debug?.(`[context-offload] L3(llm_input) MILD: tokens≈${workingTokens} >= ${mildThreshold}, starting cascade`);
         const cascadeResult = compressByScoreCascade(historyMessages, offloadMap, currentTaskNodeIds, mildScanRatio, logger);
         _mildReplaced = cascadeResult.replacedCount;
-        logger.debug?.(`[context-offload] L3(llm_input) MILD done: replaced=${cascadeResult.replacedCount}, finalThreshold=${cascadeResult.finalThreshold}, ids=[${cascadeResult.replacedToolCallIds.slice(0,5).join(",")}${cascadeResult.replacedToolCallIds.length > 5 ? "..." : ""}]`);
+        logger.debug?.(`[context-offload] L3(llm_input) MILD done: replaced=${cascadeResult.replacedCount}, revertFailed=${cascadeResult.revertFailedCount}, finalThreshold=${cascadeResult.finalThreshold}, ids=[${cascadeResult.replacedToolCallIds.slice(0,5).join(",")}${cascadeResult.replacedToolCallIds.length > 5 ? "..." : ""}]`);
         if (cascadeResult.replacedCount > 0) {
           for (const id of cascadeResult.replacedToolCallIds) {
             stateManager.confirmedOffloadIds.add(id);
@@ -407,7 +408,7 @@ export function compressByScoreCascade(
   logger: PluginLogger,
   minCount = MILD_CASCADE_MIN_COUNT,
   initialScore = MILD_CASCADE_INITIAL_SCORE,
-): { replacedCount: number; lastOffloadedId: string | null; finalThreshold: number; replacedToolCallIds: string[]; replacedDetails: Array<{ toolCallId: string; score: number; summaryPreview: string; originalLength?: number; summaryLength?: number }> } {
+): { replacedCount: number; lastOffloadedId: string | null; finalThreshold: number; replacedToolCallIds: string[]; replacedDetails: Array<{ toolCallId: string; score: number; summaryPreview: string; originalLength?: number; summaryLength?: number }>; revertFailedCount: number } {
   const totalMessages = messages.length;
   const scanEnd = Math.floor(totalMessages * scanRatio);
   const candidates: any[] = [];
@@ -447,7 +448,7 @@ export function compressByScoreCascade(
   }
   if (candidates.length === 0) {
     logger.debug?.(`[context-offload] L3-MILD: 0 candidates in scan range (0..${scanEnd}/${totalMessages}), offloadMap=${offloadMap.size} entries`);
-    return { replacedCount: 0, lastOffloadedId: null, finalThreshold: initialScore, replacedToolCallIds: [], replacedDetails: [] };
+    return { replacedCount: 0, lastOffloadedId: null, finalThreshold: initialScore, replacedToolCallIds: [], replacedDetails: [], revertFailedCount: 0 };
   }
   candidates.sort((a: any, b: any) => b.score - a.score);
 
@@ -483,6 +484,7 @@ export function compressByScoreCascade(
   }
 
   let replacedCount = 0;
+  let revertFailedCount = 0;
   let lastOffloadedId: string | null = null;
   const replacedIds = new Set<string>();
   const replacedToolCallIdList: string[] = [];
@@ -520,6 +522,17 @@ export function compressByScoreCascade(
           }
         }
       } else {
+        // Deep-copy the content BEFORE replaceWithSummary mutates it in place,
+        // so the over-length revert path below can restore the actual original
+        // (previously "revert" was a no-op gesture — the pre-state was already
+        // destroyed by the in-place mutation).
+        const contentSnapshot: any = msg.type === "message" ? msg.message?.content : msg.content;
+        const preReplaceContent: any =
+          typeof contentSnapshot === "string"
+            ? contentSnapshot
+            : contentSnapshot != null
+              ? JSON.parse(JSON.stringify(contentSnapshot))
+              : contentSnapshot;
         const replInfo = replaceWithSummary(msg, c.offloadEntry);
         logger.debug?.(
           `[context-offload] L3-MILD replace: [${c.msgIndex}] ${c.toolCallId} score=${c.score}, ` +
@@ -529,10 +542,15 @@ export function compressByScoreCascade(
         );
         if (replInfo.summaryLength > replInfo.originalLength) {
           logger.debug?.(`[context-offload] L3-MILD: SKIPPING replacement for ${c.toolCallId} — summary larger than original (${replInfo.originalLength} → ${replInfo.summaryLength}, delta=+${replInfo.summaryLength - replInfo.originalLength}), reverting`);
-          // Revert: the message was already mutated by replaceWithSummary,
-          // but we mark it as _offloaded anyway to avoid re-processing.
-          // The net effect is minimal since the size barely increased.
-          // In practice we simply skip counting it as a useful replacement.
+          // Revert: restore the actual deep-copied pre-replacement content.
+          // Mark _offloaded to avoid re-processing this block every cascade
+          // round, but do NOT count it as a replacement — nothing was replaced.
+          if (!restoreMessageSnapshot(msg, preReplaceContent)) {
+            // Should be unreachable by construction (snapshot is taken above);
+            // the counter exists so a future regression is visible, not silent.
+            revertFailedCount++;
+            logger.warn(`[context-offload] L3-MILD revert_failed: could not restore original content for ${c.toolCallId} — summary left in place`);
+          }
           msg._offloaded = true;
           continue;
         }
@@ -572,7 +590,7 @@ export function compressByScoreCascade(
     }
   }
 
-  return { replacedCount, lastOffloadedId, finalThreshold: activeThreshold, replacedToolCallIds: replacedToolCallIdList, replacedDetails };
+  return { replacedCount, lastOffloadedId, finalThreshold: activeThreshold, replacedToolCallIds: replacedToolCallIdList, replacedDetails, revertFailedCount };
 }
 
 // ─── User Message Protection ─────────────────────────────────────────────────

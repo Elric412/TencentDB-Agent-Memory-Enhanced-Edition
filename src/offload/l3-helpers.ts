@@ -258,6 +258,25 @@ export function replaceWithSummary(msg: any, entry: OffloadEntry): { originalLen
   return { originalLength, summaryLength: summaryContent.length };
 }
 
+/** Restore a message's content from a deep-copied pre-mutation snapshot.
+ *  Counterpart to replaceWithSummary: because that helper mutates content in
+ *  place, any "revert" decision must be made against a deep copy taken BEFORE
+ *  the call.  Handles both plain and transcript-wrapped message formats and
+ *  both string and array content.  Returns false if restoration is not
+ *  possible (snapshot invalid) — callers should surface that via a counter
+ *  rather than letting it fail silently. */
+export function restoreMessageSnapshot(msg: any, snapshot: any): boolean {
+  if (!msg || snapshot === undefined || snapshot === null) return false;
+  if (msg.type === "message") {
+    if (!msg.message) return false;
+    msg.message.content = snapshot;
+  } else {
+    msg.content = snapshot;
+  }
+  invalidateTokenCache(msg);
+  return true;
+}
+
 /**
  * Compress non-current-task tool_use blocks inside an assistant message.
  */
