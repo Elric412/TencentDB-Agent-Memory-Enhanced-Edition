@@ -1,22 +1,65 @@
 # Plan — Enhanced Fork of TencentDB Agent Memory
 
-**Scope.** This document plans a fork of `@tencentdb-agent-memory/memory-tencentdb` (v0.3.6) that (a) fixes what is provably broken, (b) replaces three mechanisms that are currently "an LLM is asked nicely" with mechanisms that have invariants, and (c) turns the system into a library that any agent harness can embed — explicitly not an MCP server.
+**What this document is.** A plan for forking `@tencentdb-agent-memory/memory-tencentdb` (v0.3.6). Three goals, in priority order:
+
+1. **Fix what is provably broken.** There are defects that make the system silently hand the model the wrong data. They are listed with file and line numbers in §2 and §5.
+2. **Replace three mechanisms that currently work by asking an LLM politely.** The Mermaid task canvas, scene distillation, and the compression scoring policy are all "write a prompt and hope." Each is replaced with something that has a checkable rule — a rule that code can verify, not just a model that can be nudged.
+3. **Turn the system into a library.** Today it only works as a plugin for one specific agent host (OpenClaw). It should be importable by any agent loop. It is explicitly **not** going to be an MCP server, and §4.7 explains why that is a technical decision rather than a taste one.
 
 ## 0. How to read this document
 
-**Evidence rule.** Every claim about the current system carries a `path:line`. Every claim about an external technique carries a name and a citation (§10). Claims with neither are labelled as bets.
+### 0.1 The rules this document holds itself to
 
-**Ambition tiers.** Each enhancement in §3 is tagged:
+**Evidence rule.** Every statement about how the current code behaves cites a `file:line`. Every statement about an outside technique cites a paper or a source (§10). If a statement has neither, it is labelled a bet and its falsifier is named.
+
+**Ambition tiers.** Every proposal in §3 is tagged with how much it changes:
 
 | Tier | Meaning |
 |---|---|
-| `fix` | Restores intended behaviour. No assumption is dropped. |
-| `increment` | Improves a mechanism within the existing design frame. |
-| `step-change` | Drops a load-bearing assumption (§2.5). Requires a kill-shot critique with a real answer and an explicit rollback path. |
+| `fix` | Makes the code do what it already claims to do. Nothing about the design changes. |
+| `increment` | Genuinely improves a mechanism, but keeps the existing design's assumptions intact. |
+| `step-change` | Throws out one of the assumptions the current design is built on (the list is in §2.5). Must survive a hostile critique and must have a documented way to turn it back off. |
 
-**Confidence.** Each enhancement declares `confidence: high | medium | bet`. A `bet` must name its falsifier — the observation that would make me abandon it.
+**Confidence.** Each proposal declares `high`, `medium`, or `bet`. A `bet` must state the specific observation that would make me abandon it. Two proposals here are bets, and both name their exit condition.
 
-**Ordering rule.** §3 proposals each begin with the *baseline* fix (the obvious move) and state where it falls short. If nothing survives that test, the item is downgraded to `increment` and moves on. The baseline is never dressed up as the proposal.
+**Ordering rule.** Every §3 proposal opens with the *obvious* fix, then says exactly where the obvious fix stops working. If the obvious fix turns out to be sufficient, the item is downgraded to `increment` and I move on. What I do not do is take the obvious fix and describe it in impressive language.
+
+### 0.2 Vocabulary
+
+The codebase and the research literature both use terms that are not self-explanatory. Defined once here, used consistently after.
+
+**Terms from the codebase**
+
+| Term | What it means here |
+|---|---|
+| **offload** | The repo's name for its short-term memory subsystem — everything under `src/offload/**` that shrinks tool-call output out of the live context window. |
+| **L0 / L1 / L2 / L3** | Confusingly, the repo uses these labels twice for different things. In *long-term* memory: L0 = raw conversation log, L1 = extracted individual facts, L2 = scene summaries, L3 = the user persona document. In *short-term* memory: L1 = per-tool-call summaries, L1.5 = task-boundary detection, L2 = the Mermaid canvas, L3 = the context-compression cascade. Where ambiguity is possible I say "long-term L2" or "offload L2". |
+| **canvas / `.mmd`** | A single Mermaid flowchart file per task that holds the agent's working state. Nodes are task stages; each node stands in for a group of tool calls. The system rewrites it as work proceeds. |
+| **ref** | An archived copy of one raw tool result, saved to `refs/*.md` before that result is compressed out of context. The only way to get the original data back. |
+| **entry** | One line in `offload-<sessionId>.jsonl`: a tool call, its short summary, its `tool_call_id`, and a score. |
+| **`node_mapping`** | The lookup table from `tool_call_id` to canvas node id. This is what makes it possible to ask "which task stage did this tool call belong to?" |
+| **`score`** | A 0–10 number the LLM assigns to each summary, meaning *how safely this summary can stand in for the original*. Higher = safer to throw the original away. The entire compression policy is driven by it. |
+| **cascade** | The compression strategy: repeatedly lower a score threshold and replace everything above it, until the context fits. |
+| **degraded entry** | An entry whose summarisation LLM call failed. It gets a placeholder summary and `score: 0`. |
+| **recall** | Fetching long-term memories and injecting them into the prompt, before the model runs. |
+| **capture** | The reverse: reading a finished conversation turn and writing memories out of it. |
+| **harness** | Whatever program runs the agent loop — sends messages to a model, executes tool calls, repeats. OpenClaw is one; a plain `while` loop is another. |
+
+**Terms from the research literature**
+
+| Term | What it means here |
+|---|---|
+| **context collapse** | A failure mode identified in ACE [7]: when an LLM is asked to rewrite an accumulated document from scratch, it quietly drops most of it. The document gets shorter and shallower on each rewrite. |
+| **Belady's MIN / offline oracle** | The provably optimal cache-eviction rule: throw out whatever will be needed furthest in the future. Impossible to run live because it requires knowing the future — but easy to compute *after the fact* from a finished trace. That makes it a source of perfect training labels [8]. |
+| **GDSF** | Greedy-Dual-Size-Frequency, a classic web-cache eviction rule [9][10]. Ranks items by value ÷ size, adjusted for access frequency, plus an "aging" term so that an item scored highly once cannot occupy the cache forever. |
+| **RRF (Reciprocal Rank Fusion)** | A standard way to merge two ranked result lists (here: keyword search and vector search) using only ranks, not scores. The repo uses the textbook constant `k = 60`. |
+| **bi-temporal validity** | From Zep [2]: storing both *when a fact was true* and *when the system learned it*. This is what makes it possible to say "the user used to live in Beijing, and now lives in Shenzhen" rather than having the two facts fight each other. |
+| **supersession** | Marking an old fact as replaced by a newer one, instead of overwriting it. Preserves the history of what changed. |
+| **content-addressed storage** | Naming a stored file after the hash of its own contents (as Git does). Two consequences: the name proves the contents, and writing the same data twice is harmless. |
+| **CAS (compare-and-swap)** | A write that only succeeds if the data has not changed since you read it. The standard defence against two writers overwriting each other. |
+| **lost in the middle** | The finding [12] that models attend well to the start and end of a long context and poorly to the middle. Means that *how much* you inject affects quality independently of *what* you inject. |
+| **kill-shot critique** | My own convention in this document: for each `step-change`, the strongest objection a competing memory-system builder would raise, stated as harshly as they would state it, followed by my actual answer. If I cannot answer it, the proposal does not belong here. |
+| **falsifier** | The specific measurement that would prove a proposal wrong. Stated up front so that abandoning the idea later is a planned outcome rather than an embarrassment. |
 
 ---
 
@@ -43,7 +86,11 @@ Two nearly independent subsystems live in the repo and share only the data direc
 
 That last row is the single most consequential structural fact in the repo, and §4 is built on it. `grep -n "offload" src/core/tdai-core.ts` returns nothing: the host-neutral facade does not know the short-term engine exists.
 
-### 1.2 Short-term data flow: log → symbol compression → storage → retrieval
+### 1.2 Short-term memory: how a tool result travels from the log to compression to retrieval
+
+**In one paragraph, before the details.** Every time the agent calls a tool, the system archives the raw result to a file and then asks an LLM to write a ≤200-character summary of it, along with a score saying how safe it would be to throw the original away. Separately, another LLM call decides whether the agent has finished one task and started another. A third LLM call maintains a single Mermaid flowchart representing the task's current state, and records which flowchart node each tool call belongs to. When the context window fills up, a compression cascade walks the score threshold downward, swapping raw tool results for their summaries until things fit. If the agent later needs the original data back, there is no API for that — the system injects a sentence telling the model to go find the archive file itself.
+
+The rest of this subsection is that same story with the code attached.
 
 **(1) Observe.** `createAfterToolCallHandler` (`src/offload/hooks/after-tool-call.ts:94`) fires per tool call. It first runs `classifyPatchEffectiveness` (`:122`) to detect whether the host actually populated `event.messages`; if not, it warns and degrades. It skips approval-pending tools (`:169`), re-reads the active `.mmd` **from disk on every tool call** (`readMmd`, `:207`), refreshes a hardcoded-Chinese `<current_task_context>` message (`:214-222`), estimates tokens with a cheap heuristic (`quickTokenEstimate`, `:364`; CJK ≈ 1.5 tok/char, else /4, `:378`) with `MAX_CONSECUTIVE_QUICK_SKIPS = 5` (`:418`), and can run the whole L3 compression cascade inline inside the tool loop (`:458-553`).
 
@@ -89,7 +136,11 @@ That prompt asks a single model call to simultaneously:
 
 The mild cascade is `compressByScoreCascade` (`src/offload/hooks/llm-input-l3.ts:402`): collect candidates in the first `scanRatio` of the array, default missing scores to 5 (`:446`), sort descending by score (`:452`), then walk `threshold` from `MILD_CASCADE_INITIAL_SCORE = 7` down to `MILD_CASCADE_FLOOR_SCORE = 1` (`:114-115`, `:492`), replacing every candidate with `score >= threshold` (`:495`). Aggressive (`:667`) splices; emergency (`:755`) does tail-delete of the largest tool-pair group (`:848`), truncates oversized messages to 2000 chars (`:968`), then strips any non-preserved field serialising over 500 chars (`:1141`).
 
-### 1.3 Long-term data flow: conversation → extraction → storage → retrieval
+### 1.3 Long-term memory: how a conversation becomes a persona
+
+**In one paragraph, before the details.** Every completed conversation turn is appended to a daily log file and indexed for search. In the background, an LLM reads batches of those turns and extracts individual memories, each tagged as a persona trait, an episodic event, or a standing instruction. A second LLM call decides whether each new memory duplicates something already stored. Periodically, an LLM *agent* with file-write access reorganises those memories into "scene" documents — one per recurring context in the user's life. Then another LLM agent reads the changed scenes and rewrites a single `persona.md`. On every subsequent turn, that persona plus a search over the extracted memories gets injected into the prompt.
+
+The rest of this subsection is that same story with the code attached.
 
 **(1) Recall (read path).** `before_prompt_build` → `performAutoRecall` (`src/core/hooks/auto-recall.ts:72`), wrapped in a `Promise.race` against `recall.timeoutMs` default 5000 (`:83-99`); on timeout it resolves `undefined` and injects nothing. Inside (`:102`): sanitize the query (`:320`), then dispatch on `recall.strategy` (`src/config.ts:93`, default `hybrid`):
 
@@ -150,90 +201,130 @@ The distinctive piece is also where the design most diverges from the literature
 
 ## 2. Step 2 — Real problems, with evidence
 
+Findings are numbered `P1`–`P13` (correctness), `Q1`–`Q6` (memory quality), and `A1`–`A9` (assumptions). §3 and §5 refer back to these numbers.
+
 ### 2.1 Correctness
 
-**P1 — `result_ref` can point at another tool's output.** `writeRefMd` (`storage.ts:532`) derives the filename purely from `isoToFilename(timestamp)` (`:527`). Two tool results archived in the same millisecond overwrite each other. Parallel tool calls in one assistant turn are normal. The failure is silent and worse than data loss: the *only* pull-path for archived output (`l3-helpers.ts:228`) returns confidently wrong bytes.
+Each finding below opens with **what actually goes wrong**, in plain terms, followed by the code that makes it happen.
 
-**P2 — task boundaries do not survive a restart, and are positional.** `l15Boundaries` (`state-manager.ts:117`) is runtime-only — absent from `DEFAULT_STATE` (`:23`) — and cleared by `switchSession` (`:284-285`), which also resets `entryCounter = entries.length`. `pushBoundary` (`:435-440`) *overwrites* the last boundary when `startIndex` matches. `resolveEntryBoundary` (`:449`) linearly scans positions. But entries are stored in a file that gets rewritten wholesale by `rewriteAllOffloadEntries` (`storage.ts:469`). Positional indices into a mutable log. Consequence: after a restart, `checkL2Trigger` (`l2-mermaid.ts:96`) skips entries with no resolvable boundary, so pending entries can sit at `node_id: null` permanently and never enter the canvas.
+**P1 — Two tool results saved in the same millisecond overwrite each other, and the survivor answers for both.**
+When the system archives a raw tool result, it names the file after the current timestamp — nothing else (`writeRefMd`, `storage.ts:532`, using `isoToFilename` at `:527`). If two tool calls finish in the same millisecond, both produce the same filename and the second write wins. The first entry's pointer now resolves to a different tool call's output. Parallel tool calls within one assistant turn are completely normal, so this is not a rare race. What makes it the worst finding in this list rather than merely a bug: that archive file is the *only* way to recover data the system has compressed away (`l3-helpers.ts:228`), so the recovery path does not fail loudly — it returns confidently wrong content.
 
-**P3 — `backfillNodeIds` fabricates provenance.** `l2-mermaid.ts:220-266`: every `wait` entry the model failed to map is assigned `getMostFrequent(mappedNodeIds)` (`:268`) or the highest-numbered node in the file (`:68`). The canvas then asserts that a node summarises tool calls that were never summarised into it. Every downstream consumer that trusts `node_id` — mild-cascade grouping, history-MMD injection (`llm-input-l3.ts:1181`), the drill-down instruction — inherits the lie.
+**P2 — Task boundaries vanish on restart, and they point at positions in a file that gets renumbered.**
+The system tracks where one task ends and the next begins. Those boundaries are stored as array indices in memory only (`l15Boundaries`, `state-manager.ts:117`) — they are absent from the persisted `DEFAULT_STATE` (`:23`) and are wiped whenever the session switches (`:284-285`). Two further problems compound it: `pushBoundary` silently overwrites the previous boundary when two share a start index (`:435-440`), and the entries that these indices point *into* get rewritten wholesale, renumbering everything (`rewriteAllOffloadEntries`, `storage.ts:469`). The visible consequence: after a restart, the canvas trigger (`checkL2Trigger`, `l2-mermaid.ts:96`) skips any entry whose boundary it cannot resolve, so those entries sit unprocessed forever and never make it into the canvas at all.
 
-**P4 — the mild cascade's "revert" does not revert.** `llm-input-l3.ts:530-538`. When the generated summary is *longer* than the original, the code logs "reverting", but `replaceWithSummary` (`l3-helpers.ts:224`) has already destroyed the message content; the branch merely sets `_offloaded = true` and skips the counter. The in-source comment concedes it ("the net effect is minimal since the size barely increased"). Net effect: the original tool output is gone from context, replaced by something larger, and the replacement is *not counted* in `replacedCount` or `replacedDetails` — so the metrics under-report both cost and loss.
+**P3 — When the model fails to say which task stage a tool call belongs to, the code makes something up.**
+The canvas is supposed to record, for every tool call, which flowchart node it belongs to. When the model's response omits some of those assignments, `backfillNodeIds` (`l2-mermaid.ts:220-266`) fills the gaps by assigning the *most frequently occurring* node id (`getMostFrequent`, `:268`), or failing that, the highest-numbered node in the file (`:68`). The result is a canvas that claims a task stage summarises tool calls it never saw. This is not a cosmetic problem, because three separate consumers trust those assignments: compression grouping, the historical-canvas injection (`llm-input-l3.ts:1181`), and the instruction that tells the model where to find archived data.
 
-**P5 — degraded entries are immortal.** The L1 fallback writes `score: 0` (`src/offload/index.ts:514`). The mild cascade floor is `MILD_CASCADE_FLOOR_SCORE = 1` (`llm-input-l3.ts:115`) and selection is `if (c.score < threshold) continue` (`:495`). A degraded entry is therefore *never* mildly compressed; it holds full-size context until aggressive/emergency deletion throws it away entirely. The exact entries the system understands least well are the ones it keeps longest and then destroys hardest.
+**P4 — The compression code contains a "revert" that does not revert anything.**
+In the compression cascade, if a generated summary turns out *longer* than the original it was meant to shrink, the code logs that it is reverting (`llm-input-l3.ts:530-538`). But the replacement already happened — `replaceWithSummary` (`l3-helpers.ts:224`) overwrote the message content in place, so there is nothing left to restore. The branch just marks the message as offloaded and skips incrementing the counter. The source comment admits as much ("the net effect is minimal since the size barely increased"). Two things are true afterwards: the original tool output is gone and has been replaced by something *bigger*, and because the counter was skipped, the metrics do not record either the cost or the loss.
 
-**P6 — stale canvas injection.** `computeFingerprint` (`mmd-injector.ts:372`) is `length + first 64 chars`. A `replace_blocks` edit that keeps total length constant and does not touch the `%%{…}%%` header — an in-place `status: doing → done` flip of equal width, say — produces an identical fingerprint and the injected block is not refreshed.
+**P5 — The entries the system understood least well are the ones it protects longest, then destroys entirely.**
+When summarisation fails, the entry is stored with `score: 0` (`src/offload/index.ts:514`). Remember that `score` means *replaceability* — higher is safer to discard. The gentle compression pass never goes below a threshold of 1 (`MILD_CASCADE_FLOOR_SCORE`, `llm-input-l3.ts:115`) and skips anything under the current threshold (`:495`). So a score of 0 means "never gently compress this." The entry holds full-size space in the context window until pressure escalates, and then the aggressive and emergency passes delete it outright. The inversion is exact: least-understood content is the last to be summarised and the first to be destroyed.
 
-**P7 — non-atomic writes.** `rewriteOffloadEntries` (`storage.ts:351`) and `rewriteAllOffloadEntries` (`:469`) are plain `writeFile`. A crash mid-write truncates the entry log, which is simultaneously the ref index, the node index, and the L2 work queue.
+**P6 — The check for "has the canvas changed?" misses the most common kind of change.**
+Before re-injecting the canvas into context, the system compares fingerprints to avoid redundant work. The fingerprint is the content's length plus its first 64 characters (`computeFingerprint`, `mmd-injector.ts:372`). Canvases share a standard header and change in the middle. A status flip from `doing` to `done` of equal character width leaves both the length and the first 64 characters untouched — so the fingerprint matches, the system concludes nothing changed, and the model keeps seeing the old task state.
 
-**P8 — failed turns are never captured.** `index.ts:661-664`: `agent_end` returns early when `!e.success`. Failures are where the highest-value memory lives (doc 13's "the most dangerous drift is the loss of *why*"); the system is structurally blind to them.
+**P7 — A crash during a log rewrite truncates the log.**
+`rewriteOffloadEntries` (`storage.ts:351`) and `rewriteAllOffloadEntries` (`:469`) overwrite the live file with a plain `writeFile` — no temporary file, no rename, no flush. An interrupted write leaves a partial file. That file is simultaneously the archive index, the canvas-node index, and the work queue, so a truncation takes out all three at once.
 
-**P9 — the advertised tool budget is not enforced.** `index.ts:350` and `:438` both carry `// TODO: implement hard per-turn call limit via before_tool_call hook + execute early-return`. The "combined limit of 3 calls per turn" exists only as English prose inside the tool description (`:358`, `:448`) and in the injected guide (`auto-recall.ts:44-47`).
+**P8 — Turns that failed are thrown away, and those are the valuable ones.**
+`agent_end` returns early whenever the turn was unsuccessful (`index.ts:661-664`), so nothing is captured. But a failed turn is exactly the material for "we tried this and it did not work" — doc 13's point that the most damaging kind of memory loss is losing the *why*. As written, the system cannot learn from failure because it never records it.
 
-**P10 — silent parse loss.** `parseExtractionResult` (`l1-extractor.ts:353-409`) returns `[]` on any parse failure. A whole extraction window disappears with no distinguishable signal from "nothing worth remembering".
+**P9 — The tool-call limit the system advertises to the model is not implemented.**
+Both memory tools carry the comment `// TODO: implement hard per-turn call limit via before_tool_call hook + execute early-return` (`index.ts:350`, `:438`). The "at most 3 calls per turn" rule exists only as English text inside the tool descriptions (`:358`, `:448`) and in the guide injected into the prompt (`auto-recall.ts:44-47`). The model is being told about an enforcement mechanism that does not exist.
 
-**P11 — dedup failures create duplicates.** `l1-dedup.ts:392` `fallbackStoreAll` is the terminal handler for every failure path in `batchDedup`. Duplicates accumulate silently and then compete with each other in RRF at recall time.
+**P10 — When memory extraction fails to parse, it reports finding nothing.**
+`parseExtractionResult` (`l1-extractor.ts:353-409`) returns an empty array on any parse failure. An empty array is also the correct answer for "this conversation genuinely contained nothing worth remembering." The two cases are indistinguishable to every caller and to every metric, so an entire window of conversation can silently disappear and register as a clean, successful, zero-memory extraction.
 
-**P12 — arbitrary truncation.** `l1-extractor.ts:209` is `extracted.slice(0, maxMemoriesPerSession)`. The prompt spends three paragraphs assigning priority bands (`l1-extraction.ts:44-57`) and the truncation ignores them.
+**P11 — When deduplication fails, everything gets stored, duplicates included.**
+`fallbackStoreAll` (`l1-dedup.ts:392`) is the last-resort handler for every failure path in the dedup step. It writes all candidates to the live store. Duplicates accumulate with no signal, then compete against each other in the search ranking at recall time, so one fact crowds out others by appearing several times.
 
-**P13 — recall timeouts are indistinguishable from empty recall.** `auto-recall.ts:92-97` resolves `undefined` on timeout; the caller cannot tell a 5-second timeout from "no memories matched", and no counter separates them.
+**P12 — Memory extraction discards results in whatever order the model emitted them.**
+The cap is applied as `extracted.slice(0, maxMemoriesPerSession)` (`l1-extractor.ts:209`). Meanwhile the extraction prompt spends three paragraphs assigning explicit priority bands to memories (`l1-extraction.ts:44-57`), including a band that means "absolute standing order." The truncation ignores all of it and keeps whichever items happened to come out first.
 
-### 2.2 Where cost actually is
+**P13 — A recall that timed out looks exactly like a recall that found nothing.**
+`performAutoRecall` races the lookup against a 5-second budget and resolves `undefined` on timeout (`auto-recall.ts:92-97`). The caller cannot distinguish "we ran out of time" from "no memories matched," and no counter separates them. So the system cannot tell whether its recall is unhelpful or merely too slow.
 
-Ranked by expected contribution, with the mechanism named:
+### 2.2 Where the cost actually is
 
-1. **L2 output tokens.** Every `file_action: "write"` re-emits the entire canvas (up to ~4000 chars, `l2-prompt.ts:30`) plus the full `node_mapping`. Triggered as often as every 4 pending entries (`config.ts:254`). This is the largest recurring generation cost in the short-term path, and most of it is re-transcription of unchanged text.
-2. **`countTokens(JSON.stringify(m))` over every message.** `computeAggressiveDeleteCount` (`llm-input-l3.ts:633`) runs full tiktoken over the entire array. `fast-token-estimate.ts` and `quickTokenEstimate` (`after-tool-call.ts:364`) exist precisely because this is too slow — meaning the system carries two token counters and a skip heuristic (`MAX_CONSECUTIVE_QUICK_SKIPS = 5`, `:418`) to work around one hot path.
-3. **Disk I/O in the tool loop.** `readMmd` on every tool call (`after-tool-call.ts:207`); `appendOffloadEntries` re-reads the whole JSONL for dedup on every append (`storage.ts:257`) — O(N²) over a session; `readAllOffloadEntries` (`:418`) reads every `offload-*.jsonl` in the agent directory; `markOffloadStatus` (`:362`) is read-all + rewrite-all.
-4. **Recall latency on the user's critical path.** `performAutoRecall` sits in `before_prompt_build` with a 5-second budget (`config.ts:95`). In non-native-hybrid mode it does an embedding round-trip plus an FTS query per turn (`auto-recall.ts:524-583`).
-5. **Long-horizon LLM agents.** Scene extraction runs a tool-enabled agent with a 300-second timeout (`scene-extractor.ts:214`); persona generation another with 180 seconds (`persona-generator.ts:153`). Both are background, but both are full agent loops, not single calls.
+Ranked by how much each one likely contributes, with the responsible mechanism named. These are hypotheses ranked by inspection; Phase 0 exists to replace them with measurements.
 
-### 2.3 Where memory quality degrades, and by which code path
+1. **Regenerating the whole canvas on every update.** The canvas-maintenance prompt lets the model choose to rewrite the entire file (`file_action: "write"`), which means re-emitting up to 4000 characters (`l2-prompt.ts:30`) plus the complete tool-call-to-node mapping. This can fire as often as every 4 pending entries (`config.ts:254`). Most of those generated tokens are re-transcription of text that did not change. This is very likely the single largest recurring generation cost in the short-term path.
+2. **Counting tokens by serialising and tokenising every message.** `computeAggressiveDeleteCount` (`llm-input-l3.ts:633`) runs the full tokeniser across the entire message array. The strongest evidence that this is too slow is that the codebase contains a *second*, cheaper token estimator to avoid it (`quickTokenEstimate`, `after-tool-call.ts:364`, plus `fast-token-estimate.ts`) and a skip heuristic on top of that (`MAX_CONSECUTIVE_QUICK_SKIPS = 5`, `:418`). Two counters and a skip rule are three workarounds for one hot path.
+3. **Filesystem work inside the tool-call loop.** The canvas file is re-read on every single tool call (`readMmd`, `after-tool-call.ts:207`). Appending an entry re-reads the whole log to check for duplicates (`appendOffloadEntries`, `storage.ts:257`), which makes total append cost grow with the square of the number of entries in a session. `readAllOffloadEntries` (`:418`) reads every log file in the agent's directory, and `markOffloadStatus` (`:362`) reads everything and rewrites everything just to change one field.
+4. **Recall sitting on the user's critical path.** Recall runs before the prompt is built, with a 5-second budget (`config.ts:95`). Unless the storage backend supports hybrid search natively, each turn costs an embedding round-trip plus a keyword query (`auto-recall.ts:524-583`) before the model can start.
+5. **Two full agent loops running in the background.** Scene extraction runs a tool-enabled LLM agent with a 300-second timeout (`scene-extractor.ts:214`); persona generation runs another with 180 seconds (`persona-generator.ts:153`). Both are off the critical path, but neither is a single model call — each is an agent that reads and writes files in a loop.
 
-**Q1 — compression decisions rest on an unvalidated self-report.** The L3 mild cascade orders the world by `entry.score` (`llm-input-l3.ts:446`, `:452`, `:495`), and `score` is produced by the same model call that wrote the summary, in the same JSON object (`l1-prompt.ts:26`), before anyone knows what the task will later need. Nothing in the codebase ever compares that prediction to an outcome. There is no feedback loop, so there is no calibration, so the number is a prior dressed as a measurement.
+### 2.3 Where memory quality degrades, and which code path causes it
 
-**Q2 — "never summarize summaries" is violated by construction.** `buildL2UserPrompt` receives only `{toolCallId, toolCall, summary, timestamp}` (`l2-prompt.ts:58-63`, `:120-123`). L2 never sees `refs/*.md`. Node summaries are summaries of L1 summaries. `buildHistoryMmdInjection` (`llm-input-l3.ts:1181`) then compresses the canvas again for injection. Three lossy stages, no regeneration from the lossless floor, and no drift measurement — the exact anti-pattern doc 13 names as the Golden Rule violation.
+**Q1 — Every compression decision rests on a number the model assigned to its own work, which nothing ever checks.**
+The compression cascade ranks everything by `entry.score` (`llm-input-l3.ts:446`, `:452`, `:495`). That score comes from the same model call that wrote the summary, in the same JSON object (`l1-prompt.ts:26`), at a moment when nobody — model included — knows what the task will need later. Nothing in the codebase ever compares that prediction against what actually happened. With no feedback there is no calibration, which makes the score a guess presented as a measurement. This is the finding E2 is built on.
 
-**Q3 — scene merging can fuse distinct entities with no check.** `scene-extractor.ts` gives an LLM write access to `scene_blocks/` (`:214`) with merge pressure applied as prompt text (`:153-162`, `:421`). Nothing validates that a merge is legitimate. A merge of "user's side project" and "user's employer" produces a plausible, well-formatted, wrong scene block, which then feeds persona generation (`persona-generator.ts:95-104`), which then gets injected into *every* turn as `<user-persona>` (`auto-recall.ts:198`). One unchecked merge propagates to the top of every future prompt.
+**Q2 — The system summarises summaries, three levels deep, and never checks the result against the original.**
+The canvas prompt receives only `{toolCallId, toolCall, summary, timestamp}` (`l2-prompt.ts:58-63`, `:120-123`) — it never sees the archived raw output in `refs/*.md`. So canvas node descriptions are summaries of summaries. Then `buildHistoryMmdInjection` (`llm-input-l3.ts:1181`) compresses the canvas *again* before injecting it. That is three lossy stages stacked, with no step that regenerates from the original data and no measurement of how far the result has drifted. Doc 13 names this specific pattern as its Golden Rule violation: never summarise a summary.
 
-**Q4 — retrieval treats standing orders as search hits.** `instruction` memories are ranked in the same pool, by the same lexical/semantic signal, as `episodic` events (`auto-recall.ts:511-645`). But a rule like "always answer in Chinese, keep it terse" shares essentially no vocabulary with the user's actual question — it is precisely the class similarity search is worst at. Worse, `applyRecallBudget` (`:708-761`) is first-come-first-served over characters: one long episodic line can evict every instruction from the injection.
+**Q3 — One bad scene merge propagates to the top of every future prompt.**
+Scene reorganisation hands an LLM write access to the `scene_blocks/` directory (`scene-extractor.ts:214`) and applies pressure to consolidate purely through prompt text (`:153-162`, `:421`). Nothing validates that a merge joins things that actually belong together. Merging "the user's side project" with "the user's employer" produces a scene document that is fluent, well-formatted, and wrong. That document then feeds persona generation (`persona-generator.ts:95-104`), and the resulting persona is injected into *every* turn as `<user-persona>` (`auto-recall.ts:198`). A single unchecked merge becomes a permanent false premise.
 
-**Q5 — no temporal validity.** L1 records carry `activity_start_time` / `activity_end_time` in metadata (`l1-extraction.ts:90`) but there is no notion of a fact being *superseded*. Dedup can `update` or `merge` (`l1-dedup.ts` action vocabulary) — which rewrites history in place rather than recording that a belief changed. "User lives in Beijing" and "user moved to Shenzhen" are two records competing in RRF, and the more lexically similar one wins.
+**Q4 — Standing instructions are made to compete in a similarity search they cannot win, then evicted by arrival order.**
+Instructions ("always reply in Chinese, keep it terse") are ranked in the same pool, by the same signal, as episodic events ("flew to Osaka on 2025-05-01") — see `auto-recall.ts:511-645`. But an instruction shares almost no vocabulary with the question it applies to; instructions are precisely the category similarity search handles worst. It gets worse at the budgeting step: `applyRecallBudget` (`:708-761`) fills a character budget first-come-first-served, so one long episodic line can push every instruction out of the prompt entirely. A rule that silently stops being applied is a policy violation, not a ranking imperfection.
 
-**Q6 — the pull path is unmeasurable.** Because drill-down is a Chinese sentence pointing at a filename (`mmd-injector.ts:354`) rather than an API, there is no event when the agent recovers archived context, no event when it fails to, and no way to attribute a task failure to a bad compression decision.
+**Q5 — Nothing records that a fact was replaced by a newer fact.**
+Memories carry activity start and end times in their metadata (`l1-extraction.ts:90`), but there is no concept of one fact *superseding* another. The dedup step can `update` or `merge`, both of which rewrite the record in place rather than recording that a belief changed. So "user lives in Beijing" and "user moved to Shenzhen" end up as two coexisting records competing in the search ranking, and whichever is more lexically similar to the query wins — regardless of which is currently true.
 
-### 2.4 Coupling — why this cannot be embedded today
+**Q6 — There is no way to tell whether context recovery ever works.**
+Recovering compressed-away data is not an API call. It is a Chinese sentence in the prompt telling the model to go read a file (`mmd-injector.ts:354`). Because no code path observes it, there is no event when the agent successfully recovers something, no event when it tries and fails, and no way to trace a task failure back to a bad compression decision. This is why several metrics in §6 currently read zero: not because the failures do not happen, but because nothing can see them.
 
-| Coupling | Evidence | Consequence |
+### 2.4 Why the system cannot be embedded in another agent today
+
+| What the code does | Where | Why it blocks embedding |
 |---|---|---|
-| The short-term engine assumes it is the *only* context engine | `src/offload/index.ts:1228-1234`: if the configured `contextEngine` slot is not this plugin, `_contextEngineRejected = true` and every offload hook becomes a no-op | Cannot coexist with a harness that has its own compaction |
-| Compression mutates the host's message objects in place | `replaceWithSummary` (`l3-helpers.ts:224-256`), `msg._offloaded = true` (`llm-input-l3.ts:500`, `:539`), `_mmdContextMessage` marker (`mmd-injector.ts:20`) | The library must own the array; no other component may hold references |
-| Module-level mutable singletons | `_sharedEngine`, `_contextEngineRegistered`, `_contextEngineRejected`, `_sharedSessions`, `_l2Running`, `_l2PollHandle`, `_reclaimTimer` (`src/offload/index.ts:75-95`) | One instance per process; no multi-tenant embedding, no test isolation |
-| Host resolved by hardcoded absolute path | `src/offload/index.ts:2170`, `:2178-2179` reference `/usr/local/lib/node_modules/openclaw/` and `/usr/lib/node_modules/openclaw/dist/plugin-sdk/index.js` | Breaks on any non-global install, container, or non-OpenClaw host |
-| Storage is `node:fs` inline | All of `src/offload/storage.ts` | No pluggable backend for the short-term artifacts, unlike long-term which has `IMemoryStore` |
-| Package exposes only the plugin | `package.json:12-17`, single `"."` export → `dist/index.mjs` | There is no importable API even for the parts that are host-neutral |
-| The host-neutral facade ignores half the system | `TdaiCore` (`src/core/tdai-core.ts`) contains zero references to offload; the gateway exposes long-term routes only (`src/gateway/server.ts:5-11`) | Embedding via the existing facade gets you long-term memory and nothing else |
-| Prompts and injected text are hardcoded Chinese | `after-tool-call.ts:214-222`, `mmd-injector.ts:350-359`, `auto-recall.ts:35-48`, all four `src/core/prompts/*` | Unusable in an English-first harness without forking strings |
+| Assumes it is the only component allowed to manage context. If the host's context-engine slot is held by anything else, the plugin sets `_contextEngineRejected = true` and every one of its hooks becomes a no-op | `src/offload/index.ts:1228-1234` | Cannot coexist with a harness that has its own compaction strategy — it does not degrade, it switches off |
+| Edits the host's message objects in place and leaves private markers on them | `replaceWithSummary` (`l3-helpers.ts:224-256`); `msg._offloaded = true` (`llm-input-l3.ts:500`, `:539`); the `_mmdContextMessage` marker (`mmd-injector.ts:20`) | The library has to own the message array outright. No other component can safely hold a reference to it |
+| Keeps its state in module-level variables: `_sharedEngine`, `_contextEngineRegistered`, `_contextEngineRejected`, `_sharedSessions`, `_l2Running`, `_l2PollHandle`, `_reclaimTimer` | `src/offload/index.ts:75-95` | One instance per Node process. No multi-tenancy, and no test isolation either — tests leak state into each other |
+| Locates the host by hardcoded absolute path — `/usr/local/lib/node_modules/openclaw/` and `/usr/lib/node_modules/openclaw/dist/plugin-sdk/index.js` | `src/offload/index.ts:2170`, `:2178-2179` | Breaks on any non-global install, in any container with a different layout, and on any host that is not OpenClaw |
+| Calls `node:fs` directly for all short-term storage | throughout `src/offload/storage.ts` | The short-term half has no pluggable storage backend, even though the long-term half already has one (`IMemoryStore`) |
+| Publishes exactly one entry point, and it is the plugin | `package.json:12-17` — a single `"."` export pointing at `dist/index.mjs` | There is no importable API at all, not even for the parts of the code that are already host-neutral |
+| The host-neutral facade covers only half the system: `TdaiCore` contains zero references to offload, and the HTTP gateway exposes long-term routes only | `src/core/tdai-core.ts`; `src/gateway/server.ts:5-11` | Embedding through the existing facade gets you long-term memory and none of the short-term compression — which is the half that produces the advertised token savings |
+| Prompts and injected instruction text are hardcoded Chinese string literals | `after-tool-call.ts:214-222`, `mmd-injector.ts:350-359`, `auto-recall.ts:35-48`, and all four files in `src/core/prompts/` | Cannot be used in an English-first harness without forking the source to edit strings |
 
-### 2.5 Load-bearing assumptions the current design treats as fixed
+### 2.5 The assumptions the current design cannot question
 
-These are the things the code cannot question. §3 proceeds by dropping specific ones.
+Everything above is a symptom. These nine are the causes: beliefs baked so deeply into the code that no amount of tuning or prompt improvement can work around them. §3 proceeds by picking specific ones and dropping them — which is exactly what separates a `step-change` from an `increment` in this document.
 
-- **A1 — A reference is a filename.** Refs are addressed by timestamp string (`storage.ts:527`); there is no digest, no integrity check, no dangling-pointer detection.
-- **A2 — The value of a compressed item is knowable at compression time.** The entire L3 policy is driven by `score` emitted at L1 time (`l1-prompt.ts:26`).
-- **A3 — The symbolic canvas must be produced by an LLM as text.** The canvas has no in-memory representation; it exists only as `.mmd` bytes plus regexes that re-parse it (`llm-input-l3.ts:1269`, `mmd-injector.ts:342`).
-- **A4 — Log entries are addressable by position.** Boundaries are `startIndex` integers (`state-manager.ts:435`, `:449`) into a file that is rewritten in place.
-- **A5 — Relevance is a single scalar over a homogeneous memory pool.** All three L1 types compete in one RRF ranking and one character budget (`auto-recall.ts:632`, `:708`).
-- **A6 — An LLM with a filesystem sandbox is an acceptable transaction manager.** Both L2 scene and L3 persona are agents that write their own output files (`scene-extractor.ts:214`, `persona-generator.ts:149`).
-- **A7 — Each layer's input is the layer below's output.** L2 reads L1 summaries, never refs (`l2-prompt.ts:120-123`).
-- **A8 — The host's generic file tools are the retrieval interface for short-term memory.** There is no `expand`/`drill-down` API; there is a sentence (`mmd-injector.ts:354`).
-- **A9 — Exactly one memory system exists in the process.** Exclusive context-engine slot plus module singletons (`src/offload/index.ts:75-95`, `:1228-1234`).
+- **A1 — A reference is a filename.** Archived tool results are addressed by a timestamp string (`storage.ts:527`). There is no hash, no integrity check, and no way to detect that a pointer has gone stale. → dropped by **E1**.
+- **A2 — How valuable a piece of context is can be known at the moment you compress it.** The whole compression policy runs on a score assigned during summarisation (`l1-prompt.ts:26`), before anything is known about what the task will need. → dropped by **E2**.
+- **A3 — The task canvas has to be text written by an LLM.** There is no in-memory representation of the canvas anywhere; it exists only as `.mmd` bytes plus regular expressions that re-parse those bytes (`llm-input-l3.ts:1269`, `mmd-injector.ts:342`). → dropped by **E3**.
+- **A4 — Log entries can be identified by their position.** Task boundaries are stored as array indices (`state-manager.ts:435`, `:449`) into a file that gets rewritten and renumbered. → dropped by **E4**.
+- **A5 — Relevance is one number over one undifferentiated pool of memories.** All three memory types compete in a single ranking and a single character budget (`auto-recall.ts:632`, `:708`). → dropped by **E5**.
+- **A6 — An LLM with filesystem access is an acceptable transaction manager.** Both scene reorganisation and persona generation are agents that write their own output files, with no validation step and no way to roll back a change that did not throw an exception (`scene-extractor.ts:214`, `persona-generator.ts:149`). → dropped by **E6**.
+- **A7 — Each layer reads only the layer below it.** The canvas prompt sees L1 summaries and never the archived originals (`l2-prompt.ts:120-123`), so errors compound downward with no correction path. → dropped by **E7**.
+- **A8 — The host's generic file-reading tools are the retrieval interface.** There is no expansion or drill-down API. There is a sentence in the prompt (`mmd-injector.ts:354`). → dropped by **E8**.
+- **A9 — There is exactly one memory system in the process.** Enforced by the exclusive context-engine slot and the module-level singletons (`src/offload/index.ts:75-95`, `:1228-1234`). → dropped by **§4.1**.
 
 ---
 
 ## 3. Step 3 — Enhancements
 
-Each item: **Baseline first** → **assumption dropped** → **import check** → the six required fields.
+### 3.0 The format of each proposal, and why it has this format
+
+Nine proposals, `E1`–`E9`. Each one is forced through the same sequence, because that sequence is what stops a plan from confidently restating the obvious.
+
+1. **Baseline first.** What is the obvious fix — the thing any competent engineer would try first? State it plainly, then state exactly where it stops working. If the obvious fix turns out to be enough, the proposal is downgraded and I move on. This ordering exists so the obvious move can never be quietly presented as the insight.
+2. **Assumption dropped.** Which of the nine assumptions in §2.5 does this abandon? If the answer is "none," the item is an `increment` at best, and the proposal says so instead of implying otherwise.
+3. **Import check.** Is there already a named, published solution to this shape of problem — from caching theory, database design, information retrieval, entity resolution? If so, use it and say plainly what was borrowed and what is genuinely new here. The point is to avoid reinventing something worse than the literature, and to avoid claiming credit for something borrowed.
+
+Then six fields, every time:
+
+- **Problem it solves** — a specific finding from §2, by number.
+- **Mechanism** — the actual algorithm or data structure. Not a goal, not a direction.
+- **Expected effect** — which metric moves, and roughly how much. Where the magnitude is genuinely unknown, it says so and Phase 0 is tasked with finding out.
+- **Ambition tier** — `fix`, `increment`, or `step-change`.
+- **Kill-shot critique** — the harshest objection a competing memory-system builder would raise, written as harshly as they would write it, followed by my real answer. If I have no answer, the proposal is cut.
+- **Cost / risk** — what this costs to build, what it might break, and how it gets turned off.
+
+Four proposals are tagged `step-change`: E2 (learned eviction), E3 (typed canvas), E5 (class-partitioned recall), and E6 (validated scene edits). Two of those — E2 and E5 — additionally carry a named falsifier, because they are the two most likely to be wrong.
 
 ### E1 — Content-addressed refs with verified provenance
 
@@ -257,14 +348,15 @@ Each item: **Baseline first** → **assumption dropped** → **import check** �
   - **GDSF (Greedy-Dual-Size-Frequency)** — Cherkasova, HPL-98-69R1 [9]; Cao & Irani, USITS'97 [10]. Cost-aware eviction that scores by benefit ÷ size, with frequency and an aging term to prevent stale high-scorers from pinning the cache. Adapted: "size" is tokens saved, "cost" is the price of a re-fetch.
   - *Invented here:* the label source. Not re-access alone (see kill-shot) but **re-access ∪ tool-repetition** — the observation that an agent which has lost necessary context re-issues the same tool with the same normalised parameters.
 - **Problem it solves.** Q1, and it makes P5 measurable rather than merely visible.
+- **The idea in plain terms, before the formalism.** Right now the system asks a model to guess, up front, how safe each piece of context is to throw away — and never checks whether the guess was right. The alternative: after a session finishes, you can look back and see exactly which discarded items the agent turned out to need. That hindsight is free and it is perfectly accurate. So use finished sessions to generate training labels, learn what "safe to discard" actually looks like, and let the model's guess become one input among several rather than the whole decision. The signal that an item was needed is either the agent explicitly asking for it back, or the agent quietly re-running the same tool call because the answer was no longer in front of it.
 - **Mechanism.** Three parts, in dependency order.
   1. *Instrument.* Requires **E8**. Every `expand()` call emits `reaccess{tool_call_id, node_id, Δturns_since_replacement}`. Independently, a normalised tool-call signature `hash(tool_name, canonical(params))` is recorded per call; a repeat of a signature whose earlier result was replaced emits `repeat_after_replacement{tool_call_id, Δturns}`.
-  2. *Label offline.* At session end, replay the trace. An item's Belady label is `SHOULD_HAVE_KEPT` iff it was re-accessed or repeated before its task's terminal L1.5 boundary, else `SAFE_TO_REPLACE`. No annotation, no judge model.
+  2. *Label offline.* At session end, replay the trace. An item is labelled `SHOULD_HAVE_KEPT` if it was re-accessed or re-run before its task ended, and `SAFE_TO_REPLACE` otherwise. This is Belady's rule applied in hindsight: no human annotation, no judge model, no reward signal — just what actually happened.
   3. *Score online.* Replace `entry.score ?? 5` (`llm-input-l3.ts:446`) with
 
      `H(e) = w₁·llm_score(e)/10 + w₂·(1 − summary_tokens/original_tokens) + w₃·log(1+repeat_prior(tool_class)) + w₄·recency_decay(e) − aging(clock)`
 
-     — GDSF-shaped, with `aging` as the classic inflation term so an old high-`H` entry cannot pin context forever, and `repeat_prior` a per-tool-class empirical rate (a `read_file` on a file that was later edited is a very different risk than a `web_search`). Weights `w₁..w₄` fit by logistic regression on the Belady labels; a default vector ships with the library and a `tdai fit-eviction` script refits from a local event log. The LLM `score` is demoted from decision to feature.
+     Reading the four terms in order: how safe the model *said* it was; how much space is actually saved by replacing it (a summary that saves nothing is not worth the risk); how often this *kind* of tool call historically gets repeated after being discarded; and how recently it was used. The subtracted `aging` term is standard GDSF practice — without it, an item that once scored highly stays protected forever, which is exactly the failure P5 describes from the other direction. `repeat_prior` is per tool class because the risks genuinely differ: a file read whose file was later edited is far more likely to be needed again than a one-off web search. The weights are fitted by logistic regression against the hindsight labels; sensible defaults ship with the library, and a `tdai fit-eviction` command refits them from a local event log. Note what happened to the LLM's score: it is still there, but demoted from *the decision* to *one feature among four*.
 - **Expected effect.** The target metric is **re-fetch rate after replacement** = fraction of mildly-compressed items the agent later had to expand or re-run. It is currently unmeasured and unmeasurable. Target: hold token savings at the current level (README claims −33% to −61%, `README.md:40-43`) while bringing re-fetch rate under 5%; or, at a fixed re-fetch rate, recover 5–10 percentage points of additional savings by safely replacing items the LLM scored conservatively. I state this as a *target*, not a prediction — see confidence.
 - **Ambition tier.** `step-change`.
 - **Kill-shot critique.** *"Re-access is a censored label. The agent cannot re-access what it does not know it lost. You will train a policy that happily discards silently-critical context, score beautifully offline, and degrade real task success — the classic reward-hacking outcome, and exactly what doc 33's AIDE² findings warn about."* — **Answer:** the objection is correct against re-access alone, and it is the reason the label is a union. Tool-repetition is the counter-signal: an agent that lost a file's contents does not need to know it lost them to re-read the file — it re-reads because the answer is not in context. Repetition is observable *without* the agent being aware of the loss, which is precisely the blind spot re-access has. Three further guards, all cheap: (i) the drill-down affordance is advertised in every injected canvas block and every replaced tool result (`mmd-injector.ts:354`, `l3-helpers.ts:228`), so the re-access action is available at every step, bounding the censoring; (ii) `error_degradation` events and L1.5 `taskCompleted` regressions are joined into the label as weak negatives; (iii) evaluation uses a held-out benchmark split — fit on WideSearch/AA-LCR traces, evaluate on SWE-bench traces — because a policy that only wins on its training distribution is the failure this critique describes.
@@ -277,7 +369,8 @@ Each item: **Baseline first** → **assumption dropped** → **import check** �
 - **Baseline first.** Improve the L2 prompt: more explicit mapping instructions, a larger char budget, few-shot examples, a retry on invalid JSON. *Where it falls short:* the prompt is already carrying eight distinct responsibilities simultaneously (§1.2 step 4), including **line-number arithmetic against a line-numbered rendering of a file** (`l2-prompt.ts:41-47`). `backfillNodeIds` (`l2-mermaid.ts:220`) exists solely because the mapping-completeness instruction — stated in the prompt in the strongest possible terms, "绝对不允许遗漏" (`l2-prompt.ts:29`) — is not reliably followed. Prompt improvements move the failure rate; they cannot make it checkable, because there is nothing to check against.
 - **Assumption dropped.** A3 — the symbolic canvas must be produced by an LLM as text.
 - **Import check.** ACE's central result: monolithic rewrites of an accumulated context cause **context collapse**, and the fix is itemised delta updates with utility counters [7]. Adapted directly — the codebase currently offers monolithic rewrite as a first-class option (`file_action: "write"`). Second import: compiler practice of keeping an AST and rendering text from it, rather than editing text. Also the graph-engineering discipline of deterministic code nodes for dedup/sort/route. **The synthesis is the contribution:** narrowing the LLM to exactly the two sub-problems that require judgment, while making every checkable property code.
-- **Problem it solves.** P3, P6, the L2 half of §2.2 cost item 1, and Q2's error compounding (with E7).
+- **Problem it solves.** P3, P6, the canvas-rewrite cost in §2.2 item 1, and (together with E7) the compounding error in Q2.
+- **The idea in plain terms, before the formalism.** Today one model call is asked to do eight things at once, including arithmetic on line numbers. Most of those eight things do not need a model at all — allocating an id, computing a timestamp range, counting how many stages are done, keeping the file under a character budget, rendering valid Mermaid. Exactly two need judgment: deciding which task stage a new tool call belongs to, and writing a readable one-line description of a stage. So: store the canvas as a real data structure, let code do all the bookkeeping, and narrow the model down to only the two questions it is actually needed for. Mermaid stops being the source of truth and becomes a rendering of it — which also means no more editing text by line number, and therefore no more line-number bugs.
 - **Mechanism.** Persist the canvas as a typed structure, render `.mmd` from it:
 
   ```ts
@@ -294,9 +387,11 @@ Each item: **Baseline first** → **assumption dropped** → **import check** �
 
   Everything checkable becomes code: monotonic id allocation (`<prefix>-N<k>`), `tsMin`/`tsMax` from member timestamps, `progress` from status counts, char-budget enforcement, mermaid rendering, and — critically — no line arithmetic at all, because there is no text patching. Validation is total: if any input id is missing from the assignment, the call is retried **with only the missing ids**, not the whole batch. After two failed retries the ids go to an explicit `unassigned` bucket that is visible in the canvas as a real node labelled "unclassified", rather than being silently glued onto the most popular node.
 
-  Re-topologisation is preserved but promoted to an explicit operation: `recompact(graph)` may emit an entirely new node set, and is triggered at L1.5 task boundaries or when node count crosses a threshold — never as a side effect of an incremental update. It is guarded by a hard invariant checked in code:
+  The ability to reorganise the whole graph is kept, but it becomes an explicit named operation instead of a side effect. `recompact(graph)` may produce an entirely new set of nodes, and it fires at task boundaries or when the node count crosses a threshold — never as an incidental consequence of adding one entry. And it is guarded by a rule that code checks every time:
 
-  `⋃ members(new nodes) == ⋃ members(old nodes)` — no `tool_call_id` may be dropped or invented.
+  `⋃ members(new nodes) == ⋃ members(old nodes)`
+
+  In words: every tool call that was accounted for before the reorganisation must still be accounted for after it. None may be dropped, and none may be invented. This is the check that is impossible to perform today — there is no prior structure to compare against — and it is nearly free once the structure exists.
 
 - **Expected effect.** `backfillNodeIds` deleted; `node_mapping` coverage becomes 1.0 by construction. Output tokens per L2 call drop from "the whole graph" to "≈ N assignment lines + a few summaries" — on a 4000-char graph with a 30-entry batch, roughly a 5–10× reduction in generated tokens per call. The class of `patchMmd` line-drift corruptions disappears because line patching disappears.
 - **Ambition tier.** `step-change`.
@@ -322,13 +417,14 @@ Each item: **Baseline first** → **assumption dropped** → **import check** �
 - **Baseline first.** Raise `recall.maxResults`, tune `scoreThreshold`, or add a cross-encoder reranker after RRF (`auto-recall.ts:632`). *Where it falls short:* all three improve *ordering inside a pool that should not exist*. A standing instruction ("always reply in Chinese, be terse") and an episodic fact ("flew to Osaka 2025-05-01") are ranked by the same signal against the same query, and then compete for the same character budget on a first-come-first-served basis (`applyRecallBudget`, `:708-761`). A perfect reranker still cannot retrieve an instruction that shares no vocabulary with the question, because similarity is the wrong relation for that class.
 - **Assumption dropped.** A5 — relevance is a single scalar over a homogeneous memory pool.
 - **Import check.** "Structured compatibility before semantic similarity" and per-class retrieval budgets are the retrieval discipline from the progressive-disclosure design notes; faceted retrieval is classical IR. Zep's bi-temporal validity [2] supplies the applicability predicate for episodic facts. **Adapted.** The invented part is the *budget partition* being a first-class config surface rather than an emergent property of line ordering.
-- **Problem it solves.** Q4, and partially Q5.
+- **Problem it solves.** Q4, and part of Q5.
+- **The idea in plain terms, before the formalism.** The three kinds of memory answer three different questions, so they should not be retrieved the same way. A standing instruction is not a search result — it applies because it is in force, full stop, regardless of whether it shares any words with what the user just asked. A persona trait is background that is almost always somewhat relevant. Only episodic events are genuinely a search problem. So: stop putting them in one pool. Select instructions by whether they are currently active and how important they are. Select persona traits by importance and recency. Search only over episodic events. And give each of the three its own share of the prompt budget, so a long episodic result can no longer push an active instruction out of the prompt entirely.
 - **Mechanism.** Two stages.
-  - *Stage 1 — admission (deterministic, no LLM, no embedding).* Partition by `type`.
-    - `instruction`: admitted by **standing-order semantics**, not search. Ranked by the priority bands the extraction prompt already produces (`l1-extraction.ts:57`; `-1` = absolute, `90-100` = core rule, `70-80` = important) and by supersession state, then filled up to a reserved budget share.
-    - `persona`: admitted by priority × recency decay, up to its own share.
-    - `episodic`: admitted only if it passes a compatibility predicate — activity-window overlap with any temporal expression in the query, or shared `scene_name`, or entity overlap via `source_message_ids`.
-  - *Stage 2 — ranking.* RRF runs **within the episodic pool only**. Budget is `{instruction: 25%, persona: 25%, episodic: 50%}` by default and configurable; unused share in one class spills to the others.
+  - *Stage 1 — admission. Deterministic: no model call, no embedding.* Split by memory type and admit each differently.
+    - `instruction` — admitted because it is **in force**, not because it matched a query. Ordered by the priority bands the extraction prompt already assigns (`l1-extraction.ts:57`, where `-1` means absolute standing order, `90-100` a core rule, `70-80` important) and by whether a newer instruction has superseded it. Filled up to a reserved share of the budget.
+    - `persona` — ordered by priority with a recency decay, up to its own reserved share.
+    - `episodic` — admitted only if it passes a cheap compatibility test: its activity window overlaps a time expression in the query, or it shares a `scene_name`, or it shares source messages with something already admitted.
+  - *Stage 2 — ranking.* The existing hybrid search and RRF merge run **only over the episodic pool**, which is now smaller. The default budget split is `{instruction: 25%, persona: 25%, episodic: 50%}`, configurable, and any share a class does not use spills to the others rather than being wasted.
 - **Expected effect.** The headline metric is **instruction-adherence recall** — the fraction of turns where an applicable stored instruction is actually present in the injected block. Today that number is unmeasured and can be structurally 0 for any turn whose wording does not overlap the rule. This is also the most plausible mechanism behind the PersonaMem gap the README advertises (`README.md:43`).
 - **Ambition tier.** `step-change`.
 - **Kill-shot critique.** *"Bypassing similarity for instructions is how you get instruction bloat and contradiction. After 200 sessions you have 40 standing orders, half stale, mutually inconsistent, injected on every turn — you have reinvented the prompt-bloat problem you claim to solve, and similarity search was at least acting as a filter."* — **Answer:** correct, and it means the class needs a *lifecycle*, not just a bypass. Three mechanisms, each grounded in code that already exists: (i) `l1-dedup.ts` already has an `update | merge | skip` action vocabulary — extend it with `supersede`, which marks the older record inactive with a pointer to its successor rather than rewriting it in place, giving a bounded active set and, incidentally, fixing Q5's loss-of-history; (ii) the instruction budget is a hard cap ranked by priority band, so bloat degrades gracefully into "top-N rules" instead of unbounded growth; (iii) contradiction detection: two *active* instructions whose embeddings exceed cosine 0.9 but were extracted more than N sessions apart are flagged for supersession review during the fidelity audit (E7). **Falsifier:** if under this policy the active instruction set does not stabilise below ~20 items across 200 sessions, the bypass is unsafe and recall reverts to similarity-gated for instructions.
@@ -340,7 +436,8 @@ Each item: **Baseline first** → **assumption dropped** → **import check** �
 - **Baseline first.** Tighten the scene prompt, lower `persona.maxScenes`, keep more backups (`scene-extractor.ts:140`). *Where it falls short:* none of these adds a single check. The mechanism is an LLM agent with write access to `scene_blocks/` (`:214`); the cap is a sentence (`:421`); deletion is the literal string `[DELETED]` (`:259`); and the only rollback path is `restoreLatestDirectory` **on a thrown exception** (`:227`). A merge that fuses two distinct entities into one plausible, well-formatted scene block does not throw. Prompt tightening changes the probability of a silent corruption; it does not make the corruption detectable.
 - **Assumption dropped.** A6 — an LLM with a filesystem sandbox is an acceptable transaction manager.
 - **Import check.** Two-phase commit with write-set validation (optimistic concurrency control); entity resolution with blocking and an explicit match/non-match decision (Fellegi–Sunter lineage), as used for synonymy edges in HippoRAG [6]. Doc 22's "3+ examples before promotion" supplies the abstraction gate. **Adapted.** The invented part: defining "same entity" as *co-occurrence in an L1 record* so that the compatibility test is a set operation over ids and needs no NER call.
-- **Problem it solves.** Q3, and the persona-propagation blast radius that follows from it.
+- **Problem it solves.** Q3, and everything downstream of it — a bad scene reaches the persona, and the persona reaches every prompt.
+- **The idea in plain terms, before the formalism.** Stop letting the model write the files. Have it *propose* a list of changes instead, then have ordinary code check those changes before any of them reach disk. The most important check is on merges: before combining two scenes, look at which extracted memories each one came from. If no single memory ever mentioned both, the model is generalising rather than observing — and that is allowed, but the result gets labelled as an abstraction instead of being silently filed as a fact about one project. The rest of the checks are similarly mechanical: nothing may be retired if it would orphan the memories behind it, the scene limit is enforced by code rather than requested in prose, and the whole set of changes is written to a new directory and swapped in with a single rename, so a half-applied update cannot exist.
 - **Mechanism.** The LLM stops writing files. It emits a **change proposal**:
 
   ```ts
@@ -403,9 +500,9 @@ Each item: **Baseline first** → **assumption dropped** → **import check** �
 - **Cost / risk.** Minimal.
 - **Confidence.** high.
 
-### 3.1 Considered and rejected / flagged
+### 3.1 Considered and rejected
 
-Included because the discipline of rejecting the fashionable option is part of the evidence standard.
+This section exists because a plan that only lists what it will build is not a plan — it is a wish list. Each item below is something a reader might reasonably expect to find in §3, together with the reason it is not there.
 
 - **Migrate L1 to a temporal knowledge graph (Zep/Graphiti [2]).** *Rejected for this fork.* `IMemoryStore` (`src/core/store/types.ts:235`) has no edge primitive, and both backends are flat-record-plus-vector. Retrofitting a graph means rewriting the storage layer, both adapters, and the migration scripts — and the quality gap this repo actually exhibits (§2.3) is dominated by class-blind retrieval (E5) and unchecked scene merges (E6), not by multi-hop reasoning. The *narrow* piece of Zep worth importing is bi-temporal supersession, which E5 takes without the graph.
 - **Learned extractive compression (LLMLingua-2 [4]) in place of L1 summaries.** *Flagged, not scheduled.* It is a real, well-evidenced import with a faithfulness guarantee that abstractive summarisation lacks. But this system's dominant losses are **structural** — wrong `node_id` (P3), wrong `result_ref` (P1), missing instruction (Q4) — not lexical. Revisit only after Phase 4 measurement shows lexical loss is material.
@@ -417,29 +514,31 @@ Included because the discipline of rejecting the fashionable option is part of t
 
 ## 4. Step 4 — Integration model: a library, not a server
 
-### 4.0 What the code says today
+**The goal of this section.** Anyone should be able to add this memory system to their agent by installing a package and calling a few functions — the same way you add a database client. Today that is impossible, and the reasons are specific rather than vague.
 
-The package ships exactly one entry point, `"." → ./dist/index.mjs` (`package.json:12-17`), and that entry point is an OpenClaw plugin. Consuming it means accepting all of the following at once:
+### 4.0 What stands in the way today
 
-| Coupling in the current build | Evidence |
+The package publishes exactly one entry point, `"." → ./dist/index.mjs` (`package.json:12-17`), and that entry point is an OpenClaw plugin. Using any of it means accepting all of the following at once:
+
+| What the current build requires | Where |
 | --- | --- |
-| Registration happens through host hooks (`api.on(...)`, `registerTool`, `registerContextEngine`) | `src/offload/index.ts:268`, `index.ts:352`, `:441` |
-| The context-engine slot is exclusive and the plugin *refuses to load* if another engine holds it | `src/offload/index.ts:1228-1234` |
-| Offload state is module-level, so one process = one memory system | `src/offload/index.ts:75-95` |
-| The offload engine mutates the host's message array in place and leaves private markers on it | `_offloaded` at `llm-input-l3.ts:500`, `:539`; `_mmdContextMessage` at `mmd-injector.ts:20` |
-| Compaction resolves OpenClaw-specific paths by string | `src/offload/index.ts:2170`, `:2178-2179` |
-| The host-neutral facade (`TdaiCore`) covers long-term memory only — `grep -n "offload" src/core/tdai-core.ts` returns nothing | `src/core/tdai-core.ts` |
-| The one existing non-OpenClaw surface (the Hermes HTTP gateway) exposes recall/capture/search/session-end/seed and **no offload route at all** | `src/gateway/server.ts:5-11` |
+| Registration only happens through host-specific hooks (`api.on(...)`, `registerTool`, `registerContextEngine`) | `src/offload/index.ts:268`, `index.ts:352`, `:441` |
+| It must be the *only* context manager. If another component holds that slot, the plugin disables itself entirely | `src/offload/index.ts:1228-1234` |
+| Its state lives in module-level variables, so there can be one instance per process and no test isolation | `src/offload/index.ts:75-95` |
+| It edits the host's message array in place and leaves private markers on the message objects | `_offloaded` at `llm-input-l3.ts:500`, `:539`; `_mmdContextMessage` at `mmd-injector.ts:20` |
+| It locates the host by hardcoded absolute path | `src/offload/index.ts:2170`, `:2178-2179` |
+| The one host-neutral facade it has covers long-term memory only — searching `src/core/tdai-core.ts` for "offload" returns nothing | `src/core/tdai-core.ts` |
+| The one non-OpenClaw interface that exists (the HTTP gateway) exposes recall, capture, search, session-end, and seed — and no short-term compression routes at all | `src/gateway/server.ts:5-11` |
 
-So the honest statement of the integration problem is not "add an adapter." Half the system — the half that produces the token savings the README advertises — has never been callable from outside a specific host. Everything below is shaped by that.
+The honest framing of the problem, then, is not "write an adapter." It is that half the system — specifically the half that produces the token savings the README advertises — has never been reachable from outside one particular host. Everything in this section follows from that.
 
-### 4.1 The load-bearing decision: `plan()` returns a plan
+### 4.1 The one decision everything else depends on: return a plan, do not apply it
 
-**The library never mutates the harness's message array.**
+**The library never edits the harness's message array. It returns a list of proposed edits and lets the harness apply them.**
 
-`assemble()` (`src/offload/index.ts:1393`) currently rewrites the array it is handed and stamps `_offloaded` / `_mmdContextMessage` onto message objects the host also owns. That is what makes the engine exclusive: two components cannot both rewrite the same array and both be correct, so the plugin has to claim the slot (`:1228-1234`) and reject peers.
+Today, `assemble()` (`src/offload/index.ts:1393`) rewrites the array it is handed and stamps private markers onto message objects the host also holds references to. That single design choice is what forces the plugin to be exclusive: two components cannot both rewrite the same array and both remain correct, so the plugin claims the slot (`:1228-1234`) and refuses to run if anything else has it.
 
-Instead:
+Replace it with a description of the intended change:
 
 ```ts
 type ContextOp =
@@ -456,17 +555,17 @@ interface ContextPlan {
 }
 ```
 
-The harness applies the ops, or applies some of them, or rejects the plan and asks for a smaller budget. Three things fall out of this, and they are the reason the decision is load-bearing rather than stylistic:
+The harness can then apply all of these edits, or some of them, or none — and ask for a smaller budget instead. Three consequences follow, and together they are why this is the section everything else in §4 hangs off:
 
-1. **A9 is dropped.** Two memory components can coexist because neither owns the array; the harness arbitrates. The exclusive-slot check at `src/offload/index.ts:1228-1234` becomes unnecessary rather than being worked around.
-2. **Phase 0 becomes possible.** A plan is a value. You can compute it, record it, and replay it against a fixed transcript without running an agent. Every measurement in §6 depends on this; today no such artefact exists, because the decision only exists as a side effect on an array that has already been overwritten.
-3. **P4 becomes structurally impossible.** The fake revert at `llm-input-l3.ts:530-538` restores a message whose content was already destroyed. If compression is a proposed op rather than an in-place edit, "revert" is "discard the op" and cannot lie.
+1. **Assumption A9 disappears.** Two memory components can now coexist, because neither one owns the message array; the harness decides. The exclusivity check at `src/offload/index.ts:1228-1234` is not worked around, it becomes unnecessary and gets deleted.
+2. **Phase 0 becomes possible at all.** A plan is just data. You can compute it, save it, and re-compute it against a recorded transcript without running an agent or calling a model. Every measurement in §6 depends on being able to do that. Today it is impossible, because the compression decision exists only as a side effect on an array that has already been overwritten by the time you could inspect it.
+3. **The fake revert (P4) becomes impossible to write.** Today's "revert" tries to restore content that was already destroyed. When compression is a *proposed* edit rather than an applied one, reverting means discarding the proposal — which cannot silently fail, because nothing has happened yet.
 
-The cost is real and is stated plainly in §6 as a risk: the harness can apply a partial plan, which means the library's token accounting is a *prediction* rather than a fact. Mitigation is that `apply()` ships in the SDK, reports what it actually applied, and the discrepancy is a first-class metric (`plan_apply_divergence`).
+There is a genuine cost, and §6 tracks it as a risk rather than hiding it: since the harness may apply only part of a plan, the library's token accounting becomes a prediction rather than a fact. The mitigation is that the library ships its own `apply()`, which reports exactly what it applied, and any gap between proposed and applied is itself a metric (`plan_apply_divergence`).
 
-### 4.2 Public API surface
+### 4.2 The public API
 
-Shaped by what §3 needs, not by what is currently exported.
+Shaped by what the §3 mechanisms actually need, rather than by what happens to be exported today.
 
 ```ts
 import { createMemory } from "@tencentdb-agent-memory/core";
@@ -514,16 +613,16 @@ mem.on("degradation", e => {});  // today only reachable as a report() metric ev
 mem.on("audit",       e => {});  // E7 fidelity drift
 ```
 
-Two API-shape claims worth defending explicitly, because they are the places where the surface is *not* the obvious one:
+Two of these design choices are not the obvious ones, and both are worth defending explicitly.
 
-- **`recall()` returns class-tagged blocks and a per-class budget, not a ranked list.** A ranked list is the obvious shape and it is what `applyRecallBudget` (`auto-recall.ts:708-761`) consumes today; that shape is precisely what makes Q4 possible — a standing instruction competes on cosine similarity against an episodic fact and gets evicted by arrival order. An API that returns one list cannot express "the instruction is not a search hit."
-- **`plan()` takes `counter`.** The harness's tokenizer, not ours. The system currently mixes `js-tiktoken` o200k_base with a heuristic `quickTokenEstimate` (`after-tool-call.ts:364`, `_quickCountTokens` at `:378`) and then makes eviction decisions against a ratio (`offload.mildOffloadRatio`, `config.ts:258`). A library that guesses the host's token accounting will systematically over- or under-compress on any host whose tokenizer differs. Taking the counter as a parameter converts a silent error into a required argument.
+- **`recall()` returns memories grouped by kind, each with its own budget — not one ranked list.** One ranked list is the obvious design, and it is exactly what the current code produces and consumes (`applyRecallBudget`, `auto-recall.ts:708-761`). It is also the direct cause of Q4: as soon as everything is in one list, a standing instruction has to compete on textual similarity against an episodic fact, and then loses its place in the prompt to whatever arrived first. An API whose return type is a single list has no way to express "this instruction is not a search result — it simply applies." So the shape of the return value has to change before the behaviour can.
+- **`plan()` requires the caller to pass in a token counter.** The harness's counter, not the library's. Today the code mixes an exact tokeniser with a cheap character-based estimate (`quickTokenEstimate`, `after-tool-call.ts:364`; `_quickCountTokens`, `:378`) and then makes irreversible eviction decisions against a ratio of the context window (`offload.mildOffloadRatio`, `config.ts:258`). Any library that *guesses* how its host counts tokens will systematically over-compress or under-compress on every host whose tokeniser differs from its assumption — silently, and in a way that looks like a quality problem rather than an accounting problem. Making the counter a required argument turns that silent error into something the integrator cannot get wrong by accident.
 
 ### 4.3 Pluggable backends
 
-Four adapters. Two already exist in usable shape; two do not exist at all.
+Four things get swapped out through interfaces. Two of those interfaces already exist in usable form; two do not exist at all.
 
-**`StorageAdapter`** — the substantive work. `IMemoryStore` (`src/core/store/types.ts:235`) already abstracts L0/L1 across SQLite+`sqlite-vec` and TencentDB VectorDB, with honest capability reporting (`StoreCapabilities`, `:181`). The offload artefacts have no such abstraction: `src/offload/storage.ts` calls `node:fs` directly throughout (`appendOffloadEntries` `:257`, `rewriteOffloadEntries` `:351`, `readAllOffloadEntries` `:418`, `writeRefMd` `:532`, `patchMmd` `:579`, `listMmds` `:635`). Extend the interface:
+**`StorageAdapter`** — this is where the real work is. The long-term half already has a proper storage interface: `IMemoryStore` (`src/core/store/types.ts:235`) covers both SQLite and TencentDB VectorDB and honestly reports which capabilities each backend has (`StoreCapabilities`, `:181`). The short-term half has nothing equivalent — `src/offload/storage.ts` calls `node:fs` directly throughout (`appendOffloadEntries` `:257`, `rewriteOffloadEntries` `:351`, `readAllOffloadEntries` `:418`, `writeRefMd` `:532`, `patchMmd` `:579`, `listMmds` `:635`). So the interface gets extended to cover the short-term artefacts too:
 
 ```ts
 interface StorageAdapter extends IMemoryStore {
@@ -799,3 +898,205 @@ Doc 33's AIDE² result — that a large majority of self-proposed improvements a
 - **Token savings are never reported alone.** Every token number is paired with a success rate from the same run. Aggressive compression trivially wins on tokens; the pairing is what stops that from looking like progress.
 - **Nothing is judged by an LLM grading its own output.** Canvas fidelity (E7) is scored by comparing regenerated summaries against source refs, not by asking a model whether it likes its own canvas.
 - **Length-matched comparison.** Since lost-in-the-middle [12] and context-rot effects make quality a function of context length independent of content, any comparison of two retrieval strategies must hold total injected tokens roughly constant, or the result measures length rather than strategy.
+
+---
+
+## 7. Step 6 — Phased roadmap
+
+No time estimates. Phases are ordered by dependency, and by the rule that **fixes come before step-changes**. Where that rule is broken, the deviation is stated and justified on the spot. Every phase has an entry condition, an exit condition that is a test or a measurement rather than a judgement call, and — for `step-change` work — a rollback path that gets exercised rather than merely described.
+
+### Phase 0 — Reproduce and measure the baseline
+
+**No behavioural changes. None.** The only code written in this phase is code that observes.
+
+**Scope**
+- Stand up the three-arm test harness from §6.4 (no memory layer / host-native compaction / current system) on all four benchmarks (`README.md:39-42`), and reproduce the published numbers within noise. If they do not reproduce, that is this phase's finding, and the roadmap stops until it is understood.
+- Build the transcript recorder and replayer: capture message arrays, tool calls, and tool results, then replay them offline. This is the artefact every later measurement depends on.
+- Inject `Clock` and `IdGen` (§4.3) at the three places that currently read the ambient clock and random source (`storage.ts:527`, `auto-capture.ts:41-43`). This is a pure refactor with no change in behaviour, which is why it is allowed in a no-changes phase.
+- Land the instrumentation gates from §6.2 and the error counters from F11 and F18. These two fixes are prerequisites *for* measurement rather than consequences of it (§5.4).
+- Record the mechanism metrics in §6.3 as they stand today. Most will read zero or be uncomputable. **That reading is the baseline**, and it is what the rest of the plan is accountable to.
+- Measure §2's cost hotspots against real traces: LLM calls and tokens per pipeline stage, `before_prompt_build` p95 latency, filesystem operations per turn.
+
+**Dependencies** — none. This is the entry point.
+
+**Ambition tiers delivered** — none, deliberately. Two `fix`-tier items (F11, F18) are pulled forward because §6 cannot be computed without them. That is the roadmap's only forward deviation from fixes-before-features, and it moves in the conservative direction.
+
+**Entry criteria** — the repo builds and `vitest run` passes on `main`.
+
+**Exit criteria — all must hold**
+1. Published benchmark numbers reproduced within a documented noise band, or a written explanation of the gap.
+2. A recorded transcript replays twice and produces byte-identical stored files.
+3. Every metric in §6.3 has either a baseline value or a written reason it cannot yet be computed, naming the code path responsible.
+4. The host-native-compaction control arm runs and produces numbers.
+
+**Rollback** — not applicable. Nothing changed.
+
+**The uncomfortable exit condition.** If the control arm matches the current system on three of the four benchmarks, then the value of the entire offload engine is in question, and Phases 2–5 need re-scoping *before* they are built rather than after. That is a legitimate outcome of this phase and must be reported as one.
+
+### Phase 1 — Correctness floor
+
+**Scope** — the S1 and S2 fixes from §5 that do not require the SDK refactor: F1 (using E1's content-addressed refs), F2 (the deep-copy patch), F3 with E9, F4 with E4, F5, F6, F8, F10, F12, F13, F16. Plus the two cheap S3 items, F7 and F17, because they reduce measurement noise.
+
+**Dependencies** — Phase 0's replay harness. Each fix needs a failing test first, and several of these bugs (F1, F8, F16) are only reliably reproducible with a frozen clock.
+
+**Ambition tiers** — all `fix`, plus one `increment` (E9). No step-changes.
+
+**Entry** — Phase 0's exit criteria hold.
+
+**Exit criteria — all must hold**
+1. Every listed F-item has a test that fails on the Phase-0 commit and passes now. No exceptions, and nothing "verified by inspection."
+2. `recovery_success_rate` is 100% on a replay corpus that deliberately forces same-millisecond ref writes.
+3. `unmapped_node_rate` reports a real value, and the fabrication path at `l2-mermaid.ts:220-266` is deleted from the codebase rather than flagged.
+4. No benchmark regression against the Phase-0 baseline (§6.4's no-regression floor).
+5. `degraded_entry_rate` is non-zero and observable. If it reads zero, the instrumentation is wrong, because the code path that produces degraded entries demonstrably exists.
+
+**Rollback** — the rollback unit for `fix`-tier work is the commit; per-fix feature flags are not warranted. F3 is the exception and ships behind a config switch, because it changes eviction order and could interact with the cascade in ways unit tests will not catch.
+
+### Phase 2 — The SDK boundary
+
+**Scope** — all of §4. `createMemory`/`Session`/`ContextPlan`, the four adapters, and the plan-instead-of-mutate migration. Delete the exclusive context-engine claim (`src/offload/index.ts:1228-1234`) and the module-level singletons (`:75-95`). Fix F14's hardcoded paths and F15's hardcoded strings. Ship F9's real tool budget together with E8's `expand()`. The OpenClaw plugin is rewritten as the thin adapter shown in §4.5(c).
+
+**Dependencies** — Phase 1. Moving buggy behaviour to a new boundary preserves the bugs and makes them harder to find. E1 (Phase 1) is also a hard prerequisite for E8.
+
+**Ambition tiers** — one `increment` (E8), plus a large structural refactor that is not itself a memory mechanism. It sits here rather than later because E2, E3, E5, and E6 all need the boundary: E2 needs `expand()`'s re-access events, E3 needs a versioned `writeGraph`, E5 needs a per-class recall budget that the current API cannot express.
+
+**Entry** — Phase 1's exit criteria hold.
+
+**Exit criteria — all must hold**
+1. The offload engine runs to completion in a test harness with no OpenClaw installed (F14's detection test).
+2. Benchmark results on the replay corpus are byte-identical before and after the refactor. This is a refactor; any behavioural difference is a mistake rather than an improvement, and must be traced before the phase closes.
+3. `plan_apply_divergence` is 0 when the harness uses the supplied `apply()`.
+4. Two memory components can be registered in one process without either one failing to load.
+5. A worked wiring example for a non-OpenClaw harness runs end to end in CI.
+6. Every constant named in §4.4 is reachable from configuration.
+
+**Rollback** — the old plugin path stays in the tree behind a build flag until exit criterion 2 has held across a full benchmark run on the private split, then it is deleted. Keeping it longer produces two code paths that drift apart.
+
+### Phase 3 — Retrieval correctness
+
+**Scope** — E5 in full (class-partitioned recall, standing-order semantics for instructions, the 25/25/50 budget split, and the `supersede` operation), plus the parts of E6 that are pure hygiene: the `SceneOp` schema, evidence conservation, and the atomic directory rename that replaces the current backup-and-restore dance (`scene-extractor.ts:140`, `:227`).
+
+**Dependencies** — Phase 2's per-class recall API. This phase comes deliberately *before* the compression step-changes, for two reasons: Q4 (a standing instruction silently evicted by a character budget) is a policy violation wearing a feature's clothing, and retrieval changes are far easier to attribute than compression changes.
+
+**Ambition tiers** — one `step-change` (E5) and the fix-shaped half of another (E6). This is the roadmap's one deviation from strict fixes-before-step-changes, and the reason is stated rather than assumed: E5's step-change component is the *semantics* of instructions — standing orders rather than search hits — and that cannot be delivered as a fix, because the current API has nowhere to put it.
+
+**Entry** — Phase 2's exit criteria hold.
+
+**Exit criteria — all must hold**
+1. `instruction_survival_rate` ≥ 0.95 on a labelled probe set whose instructions are deliberately placed beyond the old character budget. The Phase-0 baseline is expected to be substantially lower; the actual figure is what this target gets calibrated against.
+2. `stale_fact_rate` measurably reduced on the supersession probe, with `supersede` operations visible in traces.
+3. `evidence_conservation` is 1.0 across all scene operations on the replay corpus — no L1 record loses its last referent.
+4. `recall_precision@k` not regressed for any class relative to Phase 0.
+5. PersonaMem not regressed.
+6. **E5's falsifier checked.** The active instruction set must stabilise below roughly 20 items across a 200-session corpus. If it does not, instructions are accumulating without expiry, E5's standing-order model is wrong as specified, it reverts to a weighted-class scheme, and the step-change claim is withdrawn.
+
+**Rollback** — E5 ships behind a policy switch; `recall.partitioned: false` restores single-pool ranking. CI exercises the switch in both positions for the duration of the phase, so the fallback is known to work rather than assumed to.
+
+### Phase 4 — The typed canvas
+
+**Scope** — E3 in full: the typed `TaskGraph` behind `readGraph`/`writeGraph`, the two-writer split (deterministic code for structural updates, narrowed LLM calls for summaries only), and `recompact` guarded by the membership invariant. Mermaid becomes a rendered view rather than the source of truth. E7's regeneration-and-audit rides along, because it needs exactly the same provenance links.
+
+**Dependencies** — Phase 2's versioned storage, and Phase 1's F4 (`seq` numbering), since a graph indexed by positional boundaries inherits the renumbering bug.
+
+**Ambition tiers** — one `step-change` (E3) plus one `increment` (E7).
+
+**Entry** — Phase 3's exit criteria hold.
+
+**Exit criteria — all must hold**
+1. `canvas_entity_retention` ≥ 0.99, excluding explicit deletions. The invariant makes silent entity loss unrepresentable, so a failure here indicates a bug in the invariant check rather than a tuning problem.
+2. Structural updates require zero LLM calls, and L2's share of `llm_tokens_per_turn` falls. The actual reduction is reported against the Phase-0 figure, not predicted here.
+3. `canvas_write_conflicts` is observable, and every conflict resolves without data loss.
+4. `canvas_fidelity` is measured, and drift above 15% triggers `recompact` automatically (doc 13's threshold).
+5. The rendered Mermaid stays valid and human-readable. The canvas is a debugging surface as well as a model input, and losing that is a real cost.
+6. No benchmark regression.
+
+**Rollback** — the LLM-authored canvas path is retained behind a config switch for the whole phase. E7's audit ships **off by default** and stays off unless it clears its own kill switch: more than a 15% increase in L2 cost for less than 5 points of fidelity gain means it does not ship enabled.
+
+### Phase 5 — Learned eviction
+
+**Scope** — E2. The offline Belady-style oracle over replayed sessions, the combined re-access and tool-repetition label, the learned scorer, and GDSF-style cost- and size-aware eviction with aging.
+
+**Dependencies** — everything before it. Phase 0's replay corpus (the oracle is computed offline over completed sessions), Phase 1's E1 (labels must reference the right bytes), and Phase 2's E8 (`expand()` is the only source of re-access events). It is last because it is the only mechanism here that *learns*, and a learned policy trained on instrumentation that is wrong anywhere upstream will confidently encode that error.
+
+**Ambition tiers** — one `step-change` (E2). The highest-variance item in the plan, scheduled at the point where its inputs are most trustworthy.
+
+**Entry** — Phases 0–4 exit criteria hold, and the replay corpus contains at least 200 sessions with recorded re-access events.
+
+**Exit criteria — all must hold**
+1. `wrong_replacement_rate` reduced against the Phase-1 heuristic baseline on the **private** split, not the tuning split.
+2. Success rate not regressed at equal or lower token count. Token savings alone do not pass this phase (§6.5).
+3. Every replacement decision is inspectable: score plus top contributing features, recorded in `PlanTrace`.
+4. Cold-start behaviour verified — with no trained model present, the system falls back to the Phase-1 heuristic and its metrics match Phase 1's exactly.
+5. **E2's falsifier checked.** If `repeat_after_replacement` correlates with replacement at `r < 0.2` across 200 or more sessions, the label carries no signal. E2 is then abandoned in this form and replaced by E2′: GDSF using the existing LLM-assigned score as the value term, with size and aging from the classical algorithm and no learning at all. The plan states this in advance so the fallback is a decision rather than a retreat.
+
+**Rollback** — three levels, all exercised in CI: learned scorer off (falls back to E2′), E2′ off (falls back to the Phase-1 heuristic), whole cascade off (falls back to host-native compaction). A trained model that cannot be disabled at runtime does not ship.
+
+### 7.1 Why this order
+
+The sequence is measurement → correctness → boundary → retrieval → structure → learning. It is chosen so that each phase is evaluated against instrumentation the previous phase made trustworthy.
+
+The temptation is to build E2 early, because it is the most interesting item in §3. Doing that would mean training an eviction policy on re-access labels generated by an `expand()` that does not exist yet, over refs that can silently return the wrong bytes (F1), against a baseline nobody has reproduced. It would produce a number, and the number would mean nothing.
+
+---
+
+## 8. Non-goals
+
+Stated explicitly, because each of these is something a reader might reasonably expect from a memory system and will not find here.
+
+- **Not an MCP server.** §4.7 gives the reasoning. A thin MCP façade over `expand()` alone would be defensible; it is out of scope here because building it creates pressure to move `plan()` across the same boundary, which is the specific mistake §4 exists to prevent.
+- **Not a hosted service.** The Hermes HTTP gateway (`src/gateway/server.ts:5-11`) stays as-is, a sidecar for one host. No multi-tenant service, no auth model, no rate limiting. Multi-tenancy is a genuinely different problem and pretending otherwise produces a design that serves neither case.
+- **Not a knowledge graph.** §3.1 explains the rejection. Bi-temporal supersession is imported (E5); the graph substrate is not. `IMemoryStore` (`src/core/store/types.ts:235`) has no edge primitive, and the measured quality problems are elsewhere.
+- **No multi-agent shared memory.** Cross-agent memory sharing raises write-privilege and trust questions — whose memory can poison whose — that this plan does not address. Single-agent, single-user scoping throughout.
+- **No new model training beyond E2's eviction scorer.** No fine-tuned summariser, no learned compressor, no embedding training. E2's scorer is small, gradient-boosted-tree-scale, and disableable at three levels.
+- **No prompt-language expansion.** The hardcoded Chinese strings become configuration (F15), which is a correctness and portability fix. Shipping a translated prompt set for N languages, with the evaluation that would require, is out of scope.
+- **No migration guarantee for on-disk artefacts.** JSONL layout and `.mmd` text format are explicitly internal (§4.6). Migrations will be provided; the formats are not promised. E3 cannot ship if they are.
+- **No automatic self-improvement loop.** Docs 22 and 33 describe systems that propose and evaluate their own changes. This plan borrows their *evaluation discipline* — the public/private split, the high rejection rate as the expected outcome (§6.5) — and none of their autonomy. Every mechanism here is proposed by a human and reviewed by a human.
+- **Not a benchmark-score optimisation exercise.** §6.5's guards exist to make it hard to win on tokens while losing on quality. If a phase's only result is a better token number, the phase failed.
+
+---
+
+## 9. Summary of commitments
+
+| Item | Tier | Phase | Falsifier / kill switch |
+| --- | --- | --- | --- |
+| F1–F18 error fixes (§5) | `fix` | 0–2 | Failing-test-first for each |
+| E1 content-addressed refs | `fix` | 1 | — |
+| E4 `seq` + append-only boundaries | `fix` | 1 | — |
+| E9 explicit-unknown + retry queue | `increment` | 1 | Bounded unknown pool |
+| E8 `expand()` + real tool budget | `increment` | 2 | — |
+| SDK boundary (§4) | refactor | 2 | Byte-identical replay required |
+| E5 class-partitioned recall | **`step-change`** | 3 | Instruction set must stabilise < ~20 items |
+| E6 scene propose-validate-commit | **`step-change`** | 3 | `evidence_conservation` must be 1.0 |
+| E3 typed task graph | **`step-change`** | 4 | Config switch to LLM-authored canvas |
+| E7 regeneration + fidelity audit | `increment` | 4 | Off by default; >15% cost for <5pt gain ⇒ stays off |
+| E2 learned eviction | **`step-change`** | 5 | `r < 0.2` on repeat-after-replacement ⇒ fall back to E2′ |
+
+---
+
+## 10. References
+
+[1] Packer et al., *MemGPT: Towards LLMs as Operating Systems*, arXiv:2310.08560 — virtual context management, paging between main and external context.
+
+[2] Rasmussen et al., *Zep: A Temporal Knowledge Graph Architecture for Agent Memory*, arXiv:2501.13956 — Graphiti's bi-temporal edge validity, from which E5 borrows supersession without the graph.
+
+[3] Xu et al., *A-MEM: Agentic Memory for LLM Agents*, arXiv:2502.12110 — Zettelkasten-style interlinked memory notes; considered and rejected in §3.1.
+
+[4] Pan et al., *LLMLingua-2: Data Distillation for Efficient and Faithful Task-Agnostic Prompt Compression*, arXiv:2403.12968 (ACL Findings 2024) — extractive compression as token classification; flagged in §3.1, not scheduled.
+
+[5] Chhikara et al., *Mem0: Building Production-Ready AI Agents with Scalable Long-Term Memory*, arXiv:2504.19413 — production extract-consolidate architecture and LOCOMO evaluation.
+
+[6] Gutiérrez et al., *HippoRAG: Neurobiologically Inspired Long-Term Memory for LLMs*, arXiv:2405.14831 (NeurIPS 2024) — personalized PageRank over a schemaless KG with synonymy edges; source of E6's entity-resolution approach.
+
+[7] Zhang et al., *Agentic Context Engineering: Evolving Contexts for Self-Improving Language Models*, arXiv:2510.04618 — context collapse under monolithic rewrite, and itemized delta updates as the remedy. The direct source for E3.
+
+[8] Liu et al., *An Imitation Learning Approach for Cache Replacement*, ICML 2020, arXiv:2006.16239 — Parrot: learning to imitate Belady's optimal offline policy. The template for E2.
+
+[9] Cherkasova, *Improving WWW Proxies Performance with Greedy-Dual-Size-Frequency Caching Policy*, HP Labs HPL-98-69R1, 1998 — GDSF, the cost-and-size-aware eviction rule E2 adapts.
+
+[10] Cao & Irani, *Cost-Aware WWW Proxy Caching Algorithms*, USITS 1997 — GreedyDual-Size and the aging term that prevents stale high-value entries from pinning the cache.
+
+[11] Anthropic, *Effective context engineering for AI agents* (2025), plus the context-editing and tool-result-clearing documentation — the host-native compaction baseline used as the control arm in §6.4.
+
+[12] Liu et al., *Lost in the Middle: How Language Models Use Long Contexts*, TACL 2024 — positional degradation in long contexts; the reason §6.5 requires length-matched comparisons. Chroma's *Context Rot* (2025) reports the same effect on more recent models.
+
+**Internal documents referenced by number in the text:** doc 09 (memory skills and progressive disclosure — retrieval ordering, admission gates), doc 13 (long-running memory fidelity — the never-summarise-summaries rule, the 15% drift audit threshold), doc 22 (cross-project learning — extraction over curation, the three-example promotion gate), doc 33 (recursive self-improvement — the public/private evaluation split, and the finding that committees underperform their best member), and the graph engineering playbook (deterministic code nodes, reduce-with-traceability).
