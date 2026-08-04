@@ -238,7 +238,7 @@ Both memory tools carry the comment `// TODO: implement hard per-turn call limit
 `parseExtractionResult` (`l1-extractor.ts:353-409`) returns an empty array on any parse failure. An empty array is also the correct answer for "this conversation genuinely contained nothing worth remembering." The two cases are indistinguishable to every caller and to every metric, so an entire window of conversation can silently disappear and register as a clean, successful, zero-memory extraction.
 
 **P11 — When deduplication fails, everything gets stored, duplicates included.**
-`fallbackStoreAll` (`l1-dedup.ts:392`) is the last-resort handler for every failure path in the dedup step. It writes all candidates to the live store. Duplicates accumulate with no signal, then compete against each other in the search ranking at recall time, so one fact crowds out others by appearing several times.
+`fallbackStoreAll` (`src/core/record/l1-dedup.ts:392`) is the last-resort handler for every failure path in the dedup step. It writes all candidates to the live store. Duplicates accumulate with no signal, then compete against each other in the search ranking at recall time, so one fact crowds out others by appearing several times.
 
 **P12 — Memory extraction discards results in whatever order the model emitted them.**
 The cap is applied as `extracted.slice(0, maxMemoriesPerSession)` (`l1-extractor.ts:209`). Meanwhile the extraction prompt spends three paragraphs assigning explicit priority bands to memories (`l1-extraction.ts:44-57`), including a band that means "absolute standing order." The truncation ignores all of it and keeps whichever items happened to come out first.
@@ -427,7 +427,7 @@ Four proposals are tagged `step-change`: E2 (learned eviction), E3 (typed canvas
   - *Stage 2 — ranking.* The existing hybrid search and RRF merge run **only over the episodic pool**, which is now smaller. The default budget split is `{instruction: 25%, persona: 25%, episodic: 50%}`, configurable, and any share a class does not use spills to the others rather than being wasted.
 - **Expected effect.** The headline metric is **instruction-adherence recall** — the fraction of turns where an applicable stored instruction is actually present in the injected block. Today that number is unmeasured and can be structurally 0 for any turn whose wording does not overlap the rule. This is also the most plausible mechanism behind the PersonaMem gap the README advertises (`README.md:43`).
 - **Ambition tier.** `step-change`.
-- **Kill-shot critique.** *"Bypassing similarity for instructions is how you get instruction bloat and contradiction. After 200 sessions you have 40 standing orders, half stale, mutually inconsistent, injected on every turn — you have reinvented the prompt-bloat problem you claim to solve, and similarity search was at least acting as a filter."* — **Answer:** correct, and it means the class needs a *lifecycle*, not just a bypass. Three mechanisms, each grounded in code that already exists: (i) `l1-dedup.ts` already has an `update | merge | skip` action vocabulary — extend it with `supersede`, which marks the older record inactive with a pointer to its successor rather than rewriting it in place, giving a bounded active set and, incidentally, fixing Q5's loss-of-history; (ii) the instruction budget is a hard cap ranked by priority band, so bloat degrades gracefully into "top-N rules" instead of unbounded growth; (iii) contradiction detection: two *active* instructions whose embeddings exceed cosine 0.9 but were extracted more than N sessions apart are flagged for supersession review during the fidelity audit (E7). **Falsifier:** if under this policy the active instruction set does not stabilise below ~20 items across 200 sessions, the bypass is unsafe and recall reverts to similarity-gated for instructions.
+- **Kill-shot critique.** *"Bypassing similarity for instructions is how you get instruction bloat and contradiction. After 200 sessions you have 40 standing orders, half stale, mutually inconsistent, injected on every turn — you have reinvented the prompt-bloat problem you claim to solve, and similarity search was at least acting as a filter."* — **Answer:** correct, and it means the class needs a *lifecycle*, not just a bypass. Three mechanisms, each grounded in code that already exists: (i) `src/core/record/l1-dedup.ts` already has an `update | merge | skip` action vocabulary — extend it with `supersede`, which marks the older record inactive with a pointer to its successor rather than rewriting it in place, giving a bounded active set and, incidentally, fixing Q5's loss-of-history; (ii) the instruction budget is a hard cap ranked by priority band, so bloat degrades gracefully into "top-N rules" instead of unbounded growth; (iii) contradiction detection: two *active* instructions whose embeddings exceed cosine 0.9 but were extracted more than N sessions apart are flagged for supersession review during the fidelity audit (E7). **Falsifier:** if under this policy the active instruction set does not stabilise below ~20 items across 200 sessions, the bypass is unsafe and recall reverts to similarity-gated for instructions.
 - **Cost / risk.** Adds a `superseded_by` column and an `active` predicate to L1 reads (both stores). Stage-1 admission is pure set arithmetic over data already in the row, so latency cost is ~0 — it *removes* work from the vector path by shrinking the pool.
 - **Confidence.** high on the mechanism; medium on magnitude, pending a labelled recall set (Phase 0 deliverable).
 
@@ -641,25 +641,27 @@ interface StorageAdapter extends IMemoryStore {
 }
 ```
 
-`writeGraph`/`casState` take an expected version and return a commit result rather than `void`. That is the whole of E3's two-writer safety and E4's boundary durability expressed at the storage boundary — a filesystem backend implements it with temp-write + `fsync` + `rename`, an object-store backend with a conditional PUT, and a SQL backend with a transaction. Ordinary `writeFile` cannot implement it, which is the point: the current non-atomic rewrites (F6) stop being an implementation detail and become an interface violation.
+Note that `writeGraph` and `casState` take the version the caller *expects* to be current, and return a result saying whether the write actually succeeded — rather than returning nothing and hoping. That one signature choice is where E3's two-writer safety and E4's durable boundaries actually live. Each backend implements it with whatever primitive it has: a filesystem writes to a temporary file, flushes it, and renames; an object store uses a conditional PUT; a SQL database uses a transaction. What matters is that a plain `writeFile` *cannot* satisfy this signature. That is deliberate — it turns today's unsafe rewrites (F6) from an implementation detail into something the interface refuses to allow.
 
-**`LLMAdapter`** — reuse `LLMRunnerFactory.createRunner()` / `LLMRunner.run()` (`src/core/types.ts:95-107`, `:133`) unchanged. It already carries the two things the pipelines need: a tool-enabled mode and a `workspaceDir` sandbox (`RuntimeContext`, `:41`), which is what `CleanContextRunner` relies on for scene extraction (`scene-extractor.ts:214`) and persona generation (`persona-generator.ts:149-156`).
+**`LLMAdapter`** — reuse the existing `LLMRunnerFactory.createRunner()` and `LLMRunner.run()` (`src/core/types.ts:95-107`, `:133`) with no changes. They already provide the two things the pipelines depend on: the ability to run a model with tools available, and a sandboxed working directory (`RuntimeContext`, `:41`). That is what scene extraction (`scene-extractor.ts:214`) and persona generation (`persona-generator.ts:149-156`) rely on today.
 
-**`EmbeddingAdapter`** — optional. Absent ⇒ capabilities report `vectorSearch: false` and hybrid recall degrades to FTS/BM25, which the store layer already models (`StoreCapabilities`, `src/core/store/types.ts:181`).
+**`EmbeddingAdapter`** — optional. If no embedding provider is supplied, the store reports that vector search is unavailable and recall falls back to keyword search alone. The storage layer already models exactly this situation (`StoreCapabilities`, `src/core/store/types.ts:181`), so supporting it requires nothing new.
 
-**`Clock` / `IdGen`** — injected. Today `Date.now()` and `crypto.randomBytes` are called inline (`auto-capture.ts:41-43`, `isoToFilename` at `storage.ts:527`). Injecting them is what makes Phase 0 replay bit-reproducible, and it is also the cheapest possible regression test for F1: a fixed clock makes the millisecond-collision bug deterministic instead of a heisenbug.
+**`Clock` and `IdGen`** — supplied by the caller rather than read from the environment. Today the current time and random bytes are read inline wherever they are needed (`auto-capture.ts:41-43`; `isoToFilename` at `storage.ts:527`). Passing them in is what makes Phase 0's replay reproducible: the same transcript has to produce the same output twice, and that is impossible while ids and timestamps come from the ambient environment. It is also the cheapest possible test for P1/F1 — with a frozen clock, the same-millisecond collision becomes reliably reproducible instead of an intermittent mystery.
 
 ### 4.4 Configuration
 
-`parseConfig` (`src/config.ts:335`) already produces a validated, layered object covering extraction, persona, pipeline, recall, and offload (`:18-325`). Keep it; change three things:
+`parseConfig` (`src/config.ts:335`) already produces a validated, layered configuration object covering extraction, persona, pipeline, recall, and offload settings (`:18-325`). Keep that. Change three things.
 
-1. **Presets over knobs.** `policy: "conservative" | "balanced" | "aggressive" | PolicyConfig`. The current surface exposes `mildOffloadRatio`, `aggressiveCompressRatio`, `mmdMaxTokenRatio`, `l2NullThreshold` (`config.ts:254-262`) as free parameters with no stated interaction. Named presets, plus the escape hatch to the full object.
-2. **Every threshold in the config, none in a constant.** `MILD_CASCADE_FLOOR_SCORE` (`llm-input-l3.ts:115`), `MAX_CONSECUTIVE_QUICK_SKIPS` (`after-tool-call.ts:418`), `RRF_K` (`auto-recall.ts:600`), `BG_DRAIN_TIMEOUT_MS` (`tdai-core.ts:193`) are load-bearing values currently unreachable from the outside. Anything a benchmark would sweep must be settable.
-3. **Prompts and message strings are configuration.** The hardcoded Chinese strings at `mmd-injector.ts:354` and `after-tool-call.ts:214-222` are injected into the model's context on every turn and cannot be changed without a fork (F15).
+1. **Offer named presets, not just individual dials.** `policy: "conservative" | "balanced" | "aggressive" | PolicyConfig`. Right now several compression ratios and thresholds are exposed as independent numbers (`config.ts:254-262`) with no documented relationship between them, which means the only way to configure this system correctly is to read its source. Named presets cover the common cases; the full object stays available for anyone who needs it.
+2. **Every threshold belongs in configuration, not in a source constant.** Several values that materially change behaviour are currently unreachable from outside the code: the compression floor score (`llm-input-l3.ts:115`), the token-estimate skip limit (`after-tool-call.ts:418`), the search-merge constant (`auto-recall.ts:600`), and the background-task drain timeout (`tdai-core.ts:193`). The rule: if a benchmark would want to vary it, it must be settable without editing source.
+3. **Model-facing text is configuration too.** The hardcoded Chinese strings at `mmd-injector.ts:354` and `after-tool-call.ts:214-222` are injected into the model's context on every single turn, and cannot be changed without forking the package (F15). Text the model reads is behaviour, not decoration.
 
-### 4.5 Wiring examples
+### 4.5 What integration actually looks like
 
-**(a) A bare while-loop harness** — the minimum viable integration:
+Three examples, from the simplest possible host to the existing one. Pseudocode; the point is the shape of the integration, not the syntax.
+
+**(a) A plain `while`-loop agent** — the smallest thing that can use this at all:
 
 ```ts
 const mem = await createMemory({ storage: fsStore(dir), llm, policy: "balanced", counter });
@@ -681,7 +683,7 @@ await s.capture({ messages, turnStartedAt });
 await s.end();
 ```
 
-**(b) A graph/state-machine framework** — the library appears as two nodes plus one event sink. Per the graph-engineering playbook, `plan()` is a *deterministic code node*: given the same messages, policy, and stored state it returns the same ops, so it can sit on the critical path without adding a model call.
+**(b) A graph or state-machine framework** — the library shows up as two nodes plus an event listener. Worth noting why `plan()` fits cleanly here: given the same messages, the same policy, and the same stored state, it always returns the same edits and calls no model. In the vocabulary of the graph-engineering playbook that makes it a *deterministic code node* — something safe to put directly on the critical path, because it adds no latency variance and no token cost.
 
 ```
 [ recall ] → [ plan ] → [ apply ] → [ model ] → [ tools ] → [ observe ] ─┐
@@ -705,119 +707,189 @@ export default function plugin(api) {
 }
 ```
 
-Note what is *not* there: no `registerContextEngine` exclusivity claim, no module-level singletons, no hardcoded path resolution. Those three are the entirety of the OpenClaw lock-in and all three are consequences of §4.1.
+The interesting part of (c) is what has disappeared: no claim on an exclusive context-engine slot, no module-level state, no hardcoded paths. Those three items were the entirety of the lock-in to one host, and all three go away as a direct consequence of the decision in §4.1.
 
-### 4.6 Stable contract vs internal
+### 4.6 What is promised, and what may change without warning
 
-| Stable — semver-governed | Internal — may change in any release |
+Anything in the left column is a published contract: breaking it requires a major version bump. Anything in the right column is an implementation detail that may change in any release, and integrators must not build on it.
+
+| Promised — stable across versions | Internal — may change at any time |
 | --- | --- |
-| `createMemory`, `Memory`, `Session` | The `.mmd` text format and node-id scheme (`<prefix>-N<k>`) |
-| `ContextPlan` / `ContextOp` / `PlanTrace` | Every prompt string (`l1-prompt.ts`, `l15-prompt.ts`, `l2-prompt.ts`) |
-| `RecallBlock` + its class taxonomy | Scoring weights, cascade thresholds, `RRF_K` defaults |
-| The four adapter interfaces | JSONL layout on disk (migration provided, format not promised) |
-| Event names and payloads | `_offloaded` / `_mmdContextMessage` markers — **these disappear**; nothing may depend on them |
-| The config schema (additive changes only) | The `TaskGraph` internal representation behind `readGraph`/`writeGraph` |
+| `createMemory`, `Memory`, `Session` | The `.mmd` text format and the node-id scheme (`<prefix>-N<k>`) |
+| `ContextPlan`, `ContextOp`, `PlanTrace` | Every prompt string (`l1-prompt.ts`, `l15-prompt.ts`, `l2-prompt.ts`) |
+| `RecallBlock` and its memory-type taxonomy | Scoring weights, compression thresholds, search-merge constants |
+| The four adapter interfaces | The on-disk JSONL layout — migrations will be provided, but the format is not promised |
+| Event names and their payloads | The `_offloaded` and `_mmdContextMessage` markers, which **disappear entirely**. Nothing may depend on them |
+| The configuration schema, with additive changes only | The internal `TaskGraph` representation behind `readGraph` / `writeGraph` |
 
-The `.mmd` format is deliberately on the right-hand side. E3 replaces the LLM-authored Mermaid text with a typed `TaskGraph` whose Mermaid rendering is a *view*; if the text format were a stable contract, E3 could not ship.
+The `.mmd` format is on the right-hand side on purpose. E3 replaces LLM-authored Mermaid text with a typed structure that Mermaid is merely *rendered from*. If the text format were a promised contract, E3 could never ship — so the promise is deliberately withheld.
 
-### 4.7 Why this is not an MCP server
+### 4.7 Why this is a library and not an MCP server
 
-The distinction is not stylistic and it is not about MCP being a poor protocol. It is about which call is on the hot path.
+This is not a judgement about MCP as a protocol, and it is not about taste. It is about *when* each call has to happen.
 
-`plan()` must run synchronously inside the harness's pre-inference path, with (i) the exact message array the harness is about to send, (ii) the harness's own token counter, and (iii) the ability to return a decision that the harness applies *before* it calls the model. MCP is a tool-call-shaped, out-of-process boundary: it is reached by the model deciding to call something, after the context has already been assembled and paid for. A memory layer that only speaks MCP is structurally incapable of doing the one thing this repo's offload engine exists to do — it cannot participate in context assembly, cannot enforce a budget against the harness's counter, and would add a serialization round-trip of the entire message array to every single inference.
+`plan()` has to run inside the harness, synchronously, in the moment before the model is called, and it needs three things at once: the exact message array that is about to be sent, the harness's own token counter, and the ability to hand back a decision that the harness applies *before* inference begins.
 
-There is also a plain cost argument. `plan()` fires once per turn on every turn. Shipping the full message array across a process boundary to get back an edit list, when the edit list is computed from that same array, is a round-trip whose payload is the thing being optimised.
+MCP is shaped for the opposite situation. An MCP call happens because the model decided to call a tool — which is to say, *after* the context has already been assembled and paid for. A memory layer that can only be reached over MCP therefore cannot do the one thing the short-term engine exists to do: it cannot take part in assembling the context, it cannot enforce a budget against the harness's own token count, and it would add a round-trip on the path of every single inference.
 
-Exactly one call in §4.2 is tool-shaped: `expand()`. It is model-initiated, infrequent, and returns a bounded payload — it would work fine over MCP, and a thin MCP façade over `expand()` alone is a reasonable future thing for somebody to build. It is listed as a non-goal in §8 rather than as a roadmap item, because building it would create pressure to move `plan()` across the same boundary, and that is the mistake this section exists to prevent.
+There is also a simpler cost argument. `plan()` runs once per turn, every turn. Serialising the entire message array across a process boundary in order to get back a small list of edits — edits computed from that very array — means the thing being shipped over the wire is the thing being optimised.
+
+Exactly one call in §4.2 is genuinely tool-shaped: `expand()`. It is initiated by the model, happens rarely, and returns a bounded amount of data. That one would work perfectly well over MCP, and a thin MCP wrapper around `expand()` alone would be a reasonable thing for someone to build. It appears in §8 as a non-goal rather than as a roadmap item, for one specific reason: once that boundary exists, there will be pressure to move `plan()` across it too, and that is precisely the mistake this section exists to prevent.
 
 ---
 
 ## 5. Step 5 — Error-fix plan
 
-This list is **separate from §3**. Nothing here is a feature; every item is a defect that makes the system do something other than what its own code claims it does. An item qualifies only if it can be stated as "the code at *X* asserts *Y*, and *Y* is false."
+**This list is deliberately separate from §3.** Nothing here is a new feature or an improvement. Every item is a case where the code does something other than what it claims to do. The bar for inclusion is that the defect can be stated as: *the code here asserts X, and X is false.*
 
-Each row: **root cause** (why it happens, not just where), **fix approach**, **detection** (the test that fails today and passes after). Severity: **S1** = silently returns wrong data to the model; **S2** = silently loses data or budget; **S3** = correctness-adjacent, cost, or maintainability.
+Each entry gives **what goes wrong**, the **root cause** (why it happens, not merely where), the **fix**, and the **test** — a test that fails on today's code and passes after the fix. "Verified by inspection" is not acceptable for anything in this list.
 
-### 5.1 S1 — silently wrong data reaches the model
+Severity has three levels:
 
-**F1 — Ref filenames collide, so drill-down can return another tool call's output.**
-`writeRefMd` (`storage.ts:532`) derives its filename purely from a timestamp via `isoToFilename` (`:527`) and returns `refs/${filename}` (`:543`). Two tool results archived in the same millisecond produce the same path; the second write wins and the first entry's `result_ref` now points at bytes that belong to a different tool call. Root cause: the reference identifier is a *name* derived from a non-unique attribute, and the ref path is the only drill-down route the system offers (`l3-helpers.ts:228`). Fix: content-addressed refs (E1) — filename = digest of bytes, ref = `{digest, byteLen}`, verify on read, reject on mismatch. Detection: a test that writes two distinct payloads with the clock frozen (possible once `Clock` is injected, §4.3) and asserts both are retrievable with correct content. Today that test fails.
+- **S1** — the system silently hands the model wrong data. Worst category, because nothing fails visibly.
+- **S2** — the system silently loses data, or silently wastes budget.
+- **S3** — cost, performance, and maintainability problems that are not directly incorrect.
 
-**F2 — The "revert" in the mild cascade does not revert.**
-`llm-input-l3.ts:530-538` restores a message reference after over-compression, but the content object was already replaced in place by `replaceWithSummary` (`l3-helpers.ts:224`); the restore hands back a message whose payload is the summary. Root cause: in-place mutation makes the pre-state unrecoverable, so "revert" can only be a gesture. Compounding: the failure is not counted anywhere, so the rate is unknown. Fix: short term, deep-copy the block before replacement and restore the copy, and emit a `revert_failed` counter; long term this disappears under §4.1, where compression is a proposed op. Detection: assert content equality after a forced revert.
+### 5.1 S1 — the system silently gives the model wrong data
 
-**F3 — Degraded entries are immortal and crowd out real content.**
-When L1 extraction fails, entries are stored with `score: 0` (`src/offload/index.ts:514`). The mild cascade floors at `MILD_CASCADE_FLOOR_SCORE = 1` (`llm-input-l3.ts:115`) and skips anything below the current threshold (`:495`). Since `score` is *replaceability* (`l1-prompt.ts:26`), score 0 means "never replace" — so precisely the entries the system failed to understand become the ones it will never compress, and pressure falls on well-summarised content instead. Root cause: `0` is being used for two incompatible meanings, "definitely keep" and "unknown." Fix: F3 is the correctness half of E9 — `score: null` as an explicit unknown with its own ordering position. Detection: a fixture with three degraded entries under memory pressure must not produce a plan that leaves all three untouched.
+**F1 — Two archived tool results can share a filename, so recovery returns the wrong one.**
+*What goes wrong:* `writeRefMd` (`storage.ts:532`) names the archive file after a timestamp and nothing else (`isoToFilename`, `:527`), returning `refs/${filename}` (`:543`). Two tool results archived in the same millisecond get the same path, the second overwrites the first, and the first entry's pointer now resolves to a different tool call's output.
+*Root cause:* the identifier for a piece of stored data is a *name* derived from something that is not unique. Compounding it, that path is the only recovery route the system has (`l3-helpers.ts:228`), so the failure surfaces as confidently wrong content rather than as an error.
+*Fix:* content-addressed refs, per E1 — name the file after a hash of its contents, store `{digest, byteLen}` alongside the pointer, verify on read, and raise a typed error on mismatch instead of returning bytes.
+*Test:* with the clock frozen (possible once `Clock` is injected, §4.3), write two different payloads in the same millisecond and assert that both are retrievable with their own content. This test fails on today's code.
 
-**F4 — Task boundaries are lost on session switch and can be overwritten.**
-`l15Boundaries` lives only in runtime state (`state-manager.ts:117`) and is reset by `switchSession` (`:284-285`); `pushBoundary` (`:435-440`) overwrites on index collision; boundaries are positional indices into a log that `rewriteAllOffloadEntries` (`storage.ts:469`) renumbers. Root cause: an index into a mutable sequence used as a durable identifier. Fix: `seq`-numbered entries plus an append-only `boundaries.jsonl` (E4). Detection: write boundaries, switch sessions, rewrite the log, and assert boundary→entry resolution still points at the same entries.
+**F2 — The compression code has a "revert" path that cannot revert.**
+*What goes wrong:* when a generated summary turns out longer than the original, `llm-input-l3.ts:530-538` attempts to restore the message — but `replaceWithSummary` (`l3-helpers.ts:224`) already overwrote the content in place, so the restore returns a message that still holds the summary.
+*Root cause:* editing in place destroys the previous state, which makes "revert" impossible to implement rather than merely broken. It is made worse by the fact that the failure increments no counter, so nobody knows how often it happens.
+*Fix:* immediately, copy the content block before replacing it and restore the copy, plus emit a `revert_failed` counter. In the longer term this defect stops existing under §4.1, where compression is a proposal rather than an edit — you cannot fail to undo something you never did.
+*Test:* force a revert and assert the content is byte-identical to what was there before.
 
-**F5 — `backfillNodeIds` invents provenance.**
-`l2-mermaid.ts:220-266` fills missing `node_mapping` entries using `getMostFrequent` (`:268`) and `pickMmdDerivedFallbackNodeId` (`:68`). This produces a mapping that is syntactically valid and semantically fabricated: a tool call is attributed to whichever node happened to be popular. Downstream, that attribution is what the drill-down prose (`mmd-injector.ts:354`) tells the model to trust. Root cause: the L2 prompt demands total mapping coverage ("绝对不允许遗漏", `l2-prompt.ts:29`), and when the model fails to deliver it, the code manufactures coverage instead of recording a gap. Fix: unmapped calls get `node_id: null` and are surfaced as an explicit `unmapped` count; the fallback heuristic is deleted, not improved. Detection: feed an L2 response with a deliberate mapping gap and assert no invented ids appear.
+**F3 — The entries the system understood least are the ones it will never compress.**
+*What goes wrong:* when L1 extraction fails, the entry is stored with `score: 0` (`src/offload/index.ts:514`). Recall from §0.2 that `score` means *replaceability* — high is safe to discard, low is precious. So `0` reads as "never replace this." The mild cascade will not touch anything below its floor of `1` (`MILD_CASCADE_FLOOR_SCORE`, `llm-input-l3.ts:115`) and skips entries under the current threshold (`:495`). The outcome is exactly backwards: content the system failed to summarise becomes permanently protected, and the compression pressure lands instead on content that *was* summarised well and is therefore cheap to shrink.
+*Root cause:* one value, `0`, is carrying two incompatible meanings — "definitely keep" and "we don't know." Nothing in the type system distinguishes them, so every consumer of `score` silently picks the first reading.
+*Fix:* this is the correctness half of E9. Represent unknown as `score: null`, give `null` its own explicit position in the ordering (neither maximally precious nor maximally disposable), and retry the extraction rather than freezing the failure into the store.
+*Test:* build a fixture with three failed-extraction entries and put the session under memory pressure. Assert the resulting plan touches at least one of them. Today's code leaves all three untouched.
 
-**F8 — Stale canvas injection from a weak fingerprint.**
-`computeFingerprint` (`mmd-injector.ts:372`) is `${content.length}:${content.slice(0, 64)}`. Mermaid canvases share a header and change in the middle; two different canvases of equal length with an identical first 64 characters are not a contrived case, they are the normal case for an edited graph. The result is that `maybeUpdateMmdInMessages` (`:127`) concludes "unchanged" and injects an outdated task state. Root cause: a cheap fingerprint chosen for a workload it does not match. Fix: hash the full content (the digest machinery from E1 already exists at that point). Detection: two canvases, same length, same 64-char prefix, different bodies — assert the update fires.
+**F4 — Task boundaries stop pointing at the right entries.**
+*What goes wrong:* `l15Boundaries` — the record of where one task ended and the next began — exists only in runtime state (`state-manager.ts:117`). `switchSession` clears it (`:284-285`), so it does not survive a session change. `pushBoundary` (`:435-440`) overwrites silently when two boundaries land on the same index. And because a boundary *is* a positional index into the entry log, `rewriteAllOffloadEntries` (`storage.ts:469`) renumbers the log out from under it.
+*Root cause:* a position in a mutable list is being used as a durable identifier. Positions are only stable as long as nothing is ever inserted, removed, or renumbered — and this log does all three.
+*Fix:* per E4, give every entry a monotonic `seq` that is never reused, and move boundaries into an append-only `boundaries.jsonl` that references `seq` rather than array index.
+*Test:* write two boundaries, switch sessions, rewrite the entry log, then resolve each boundary back to its entries. Assert the same entries come back. Today this fails at every one of the three steps independently.
 
-**F15 — Drill-down instructions are hardcoded, partly in Chinese, and name the wrong thing.**
-`mmd-injector.ts:354` and `after-tool-call.ts:214-222` inject fixed Chinese instruction strings into the model's context on every turn, and the drill-down prose refers to a file path that F1's collision can invalidate. Root cause: user-visible model-facing copy embedded as string literals in control-flow code. This is S1 rather than cosmetic because these strings *are* the instruction the model follows to recover compressed content. Fix: externalise into a message catalogue that is part of configuration (§4.4), with the ref identity supplied by the E1 digest rather than by a filename.
+**F5 — `backfillNodeIds` makes up provenance and the model is told to trust it.**
+*What goes wrong:* the L2 stage produces `node_mapping`, which says which canvas node each tool call belongs to. When the model omits some calls, `backfillNodeIds` (`l2-mermaid.ts:220-266`) fills the gaps by guessing — `getMostFrequent` (`:268`) attributes the call to whichever node is most common, and `pickMmdDerivedFallbackNodeId` (`:68`) picks one out of the canvas text. The result is a mapping that parses cleanly and is factually invented. The drill-down text at `mmd-injector.ts:354` then presents that attribution to the model as fact.
+*Root cause:* the L2 prompt demands complete coverage in absolute terms ("绝对不允许遗漏" — "omissions are absolutely forbidden," `l2-prompt.ts:29`). When the model cannot deliver, the code chooses to manufacture the missing coverage rather than record that coverage is missing. A hard requirement met by fabrication is worse than a soft requirement met honestly.
+*Fix:* unmapped calls get `node_id: null`, and the count of them is surfaced as an `unmapped` metric. The guessing heuristic is deleted rather than improved — there is no better guess available, only a more convincing one.
+*Test:* feed the pipeline an L2 response with a deliberate gap in `node_mapping` and assert that no node id appears in the output that was not in the model's response.
+
+**F8 — The change detector for the canvas misses real changes.**
+*What goes wrong:* `computeFingerprint` (`mmd-injector.ts:372`) summarises a canvas as `${content.length}:${content.slice(0, 64)}` — its byte length plus its first 64 characters. Mermaid canvases all start with the same header line and are edited in the middle. So two genuinely different canvases with the same length and the same opening 64 characters is not a contrived collision, it is what a normal edit produces. When it collides, `maybeUpdateMmdInMessages` (`:127`) concludes nothing changed and keeps injecting the stale task state.
+*Root cause:* a fingerprint optimised for cheapness was chosen without checking whether the data it fingerprints varies in the region it samples. Here it does not.
+*Fix:* hash the full content. By the time this lands, E1 has already introduced digest machinery, so there is nothing new to build.
+*Test:* construct two canvases with identical length and identical 64-character prefixes but different bodies, and assert the injector updates.
+
+**F15 — The recovery instructions given to the model are hardcoded strings, and one of them names a file that may not exist.**
+*What goes wrong:* `mmd-injector.ts:354` and `after-tool-call.ts:214-222` inject fixed Chinese-language instruction text into the model's context on every turn. That text is not decoration — it is the instruction the model follows when it wants to recover compressed content, and it names a specific archive filename. F1 shows that filename can resolve to a different tool call's output.
+*Root cause:* text intended for the model is embedded as string literals inside control-flow code, so it cannot be localised, reviewed, or version-controlled as content — and it hardcodes an identifier scheme that is itself unsound.
+*Fix:* move the strings into a message catalogue that is part of configuration (§4.4), and have them reference the E1 content digest instead of a filename.
+*Test:* run the injector under a non-Chinese catalogue and assert no Chinese literal reaches the message array; separately, assert the recovery instruction references a digest.
 
 ### 5.2 S2 — silent loss of data or budget
 
-**F6 — Non-atomic rewrites can truncate the entry log.**
-`rewriteOffloadEntries` (`storage.ts:351`) and `rewriteAllOffloadEntries` (`:469`) do plain `writeFile` over the live file. A crash mid-write leaves a partial JSONL; there is no temp file, no `fsync`, no rename. Root cause: durability was never a stated requirement of the storage helpers. Fix: write-temp → `fsync` → `rename`, behind the `StorageAdapter` boundary (§4.3) so every backend must provide it. Detection: inject a write failure and assert the previous file is intact and parseable.
+**F6 — A crash during a log rewrite can leave the log half-written.**
+*What goes wrong:* `rewriteOffloadEntries` (`storage.ts:351`) and `rewriteAllOffloadEntries` (`:469`) overwrite the live entry file with a plain `writeFile`. If the process dies partway through, what remains on disk is a truncated JSONL file — some entries intact, one entry cut in half, the rest gone. There is no temporary file, no `fsync`, and no atomic rename.
+*Root cause:* these helpers were written as convenience wrappers around the filesystem, and durability was never part of their stated job. Nothing in their signatures or names warns a caller that the operation is not atomic.
+*Fix:* the standard sequence — write to a temporary file, `fsync` it, then `rename` over the target. Put this behind the `StorageAdapter` boundary (§4.3) so that every backend, not just the local filesystem one, is obliged to provide it.
+*Test:* inject a failure partway through the write and assert the file on disk is still the *previous* version and still parses. Today it is neither.
 
-**F10 — Failed turns are never captured.**
-`index.ts:661-664` returns early from `agent_end` when the turn errored, so nothing reaches L0/L1. Root cause: the capture path treats failure as "nothing happened." But a failed turn is high-value memory — it is exactly the material for "we tried X and it did not work," and its absence means the same failure can be repeated indefinitely. Fix: capture failed turns with an outcome field, and let the L1 extraction prompt use the outcome rather than filtering the turn out upstream. Detection: run a turn that throws and assert an L0 record exists with `outcome: "error"`.
+**F10 — When a turn fails, nothing about it is remembered.**
+*What goes wrong:* `index.ts:661-664` returns early from the `agent_end` hook if the turn errored. Nothing reaches L0, so nothing reaches L1, so the failure leaves no trace in long-term memory.
+*Root cause:* the capture path treats "the turn failed" as equivalent to "the turn did not happen." That equivalence is wrong for a memory system specifically: a failed attempt is high-value memory. "We tried approach X here and it did not work" is one of the few kinds of memory that reliably changes future behaviour, and discarding it means the agent is free to repeat the same failure without limit.
+*Fix:* capture failed turns with an explicit outcome field, and let the L1 extraction prompt decide what to do with a failure — rather than filtering the turn out before extraction ever sees it.
+*Test:* run a turn that throws and assert an L0 record exists carrying `outcome: "error"`.
 
-**F11 — Extraction parse failures return an empty array.**
-`parseExtractionResult` (`l1-extractor.ts:353-409`) returns `[]` when the model's output does not parse. To every caller that is indistinguishable from "this conversation contained nothing worth remembering." Root cause: an error condition encoded as a valid-looking success value. Fix: throw a typed `ExtractionParseError`, count it (`l1_parse_failure_rate`), and route the turn to the retry queue from E9. Detection: feed malformed JSON and assert the counter increments rather than the pipeline reporting a clean zero-extraction turn.
+**F11 — A parse failure during extraction is reported as "nothing worth remembering."**
+*What goes wrong:* `parseExtractionResult` (`l1-extractor.ts:353-409`) returns `[]` when the model's output cannot be parsed. Every caller sees an empty array, which is exactly what a legitimately uneventful conversation produces. There is no way, downstream or in metrics, to tell the two apart.
+*Root cause:* an error condition is encoded as a perfectly valid success value. This is the same shape of defect as F18 and, less obviously, F3 — a distinguishable failure collapsed into an indistinguishable one.
+*Fix:* throw a typed `ExtractionParseError`, count it as `l1_parse_failure_rate`, and route the turn into E9's retry queue.
+*Test:* feed the parser malformed JSON and assert the failure counter increments. Assert also that the pipeline does *not* report a clean zero-extraction turn.
 
-**F12 — `fallbackStoreAll` writes duplicates on dedup failure.**
-`l1-dedup.ts:392` stores every candidate when the dedup judgment fails. Root cause: fail-open chosen to avoid data loss, with the cost paid silently in corpus quality — duplicates then dilute retrieval and inflate every later dedup batch (`countL1` per batch, `:82`). Fix: quarantine the batch in a pending table and retry, rather than committing it to the live corpus; if retries exhaust, store with a `dedup: "unverified"` flag that recall can down-weight. Detection: force a dedup failure and assert the live corpus size is unchanged.
+**F12 — When deduplication fails, duplicates are written to the live corpus.**
+*What goes wrong:* `src/core/record/l1-dedup.ts:392` (`fallbackStoreAll`) stores every candidate when the dedup judgment cannot be completed. The duplicates are now permanent members of the corpus.
+*Root cause:* the design chose to fail *open* — better to keep everything than lose something. That instinct is defensible, but the cost is paid silently and it compounds: duplicates dilute retrieval quality, and because every later dedup batch counts the existing corpus (`countL1`, `:82`), they also make each subsequent dedup pass more expensive and more likely to fail the same way.
+*Fix:* quarantine the batch in a pending area and retry it, instead of committing it to the live corpus. If retries are exhausted, store it with a `dedup: "unverified"` flag that recall can deliberately down-weight. This keeps the fail-open guarantee without pretending the data is clean.
+*Test:* force a dedup failure and assert the live corpus size is unchanged and the pending count went up by the batch size.
 
-**F13 — Extraction truncation ignores priority.**
-`l1-extractor.ts:209` applies `slice(0, maxMemoriesPerSession)` (`config.ts:43`) to the extracted list in model output order. The prompt defines explicit priority bands (`l1-extraction.ts:44`, `:51`, `:57`), and the truncation discards them. Root cause: a cap applied after extraction but before any ordering step. Fix: sort by priority band, then type, then truncate — and log what was dropped. Detection: an extraction whose last item is highest-priority must survive a cap of 1.
+**F13 — When too many memories are extracted, the wrong ones are thrown away.**
+*What goes wrong:* `l1-extractor.ts:209` applies `slice(0, maxMemoriesPerSession)` (`config.ts:43`) to the extracted list in whatever order the model emitted it. The extraction prompt defines explicit priority bands (`l1-extraction.ts:44`, `:51`, `:57`), and this truncation ignores them completely — a top-priority memory that happened to be emitted last is dropped in favour of a low-priority one emitted first.
+*Root cause:* a cap applied after extraction but before any sorting step. The priority information exists; it is simply never consulted at the point where it matters.
+*Fix:* sort by priority band, then by type, then truncate — and log what was dropped so the loss is visible rather than inferred.
+*Test:* construct an extraction whose *last* item is highest-priority and apply a cap of 1. Assert that item survives.
 
-**F18 — Recall timeout is indistinguishable from no results.**
-`performAutoRecall` (`auto-recall.ts:83-99`) races the inner call against `recall.timeoutMs` (`config.ts:95`) and returns empty on timeout. Downstream and in metrics, that is identical to a genuine miss. Root cause: two very different failure modes collapsed onto one return value. Fix: distinct `recall_timeout` counter and a distinguishable return, so §6 can report hit rate and timeout rate separately. Detection: force a timeout and assert the counters differ.
+**F18 — A recall that timed out looks exactly like a recall that found nothing.**
+*What goes wrong:* `performAutoRecall` (`auto-recall.ts:83-99`) races the retrieval against `recall.timeoutMs` (`config.ts:95`) and returns an empty result on timeout. Downstream code and every metric see the same thing they would see for a genuine miss.
+*Root cause:* two failure modes with completely different remedies — "the index does not contain what you need" versus "the index is too slow" — are collapsed onto one return value.
+*Fix:* a separate `recall_timeout` counter plus a return value that distinguishes the cases, so §6 can report hit rate and timeout rate as independent numbers. This is a prerequisite for Phase 0 measurement, not a Phase 1 nicety.
+*Test:* force a timeout and assert the timeout counter moved while the miss counter did not.
 
-**F9 — The tool-call budget is advertised but not enforced.**
-`index.ts:350` and `:438` are TODOs; the "at most 3 calls" limit exists only as prose in the tool descriptions (`:358`, `:448`) and in `MEMORY_TOOLS_GUIDE` (`auto-recall.ts:44-47`). Root cause: enforcement was deferred and the prose shipped anyway, so the documented contract and the actual behaviour differ with no runtime signal. Fix: a real shared per-turn counter in `before_tool_call`, covering all memory tools (this is the enforcement half of E8). Detection: issue four memory-tool calls in one turn and assert the fourth is refused with a structured message.
+**F9 — The "at most 3 calls" limit on memory tools does not exist in code.**
+*What goes wrong:* `index.ts:350` and `:438` are TODOs where the enforcement should be. The limit is stated to the model as prose in the tool descriptions (`:358`, `:448`) and in `MEMORY_TOOLS_GUIDE` (`auto-recall.ts:44-47`), and nowhere else. A model that ignores the prose is not stopped, and no counter records that it happened.
+*Root cause:* enforcement was deferred, but the documentation shipped anyway. The result is a stated contract that diverges from actual behaviour with no runtime signal that the divergence occurred.
+*Fix:* a shared per-turn counter checked in `before_tool_call`, covering all memory tools together rather than each one separately. This is the enforcement half of E8.
+*Test:* issue four memory-tool calls within one turn and assert the fourth is refused with a structured error the model can read.
 
 ### 5.3 S3 — cost, hygiene, and maintainability
 
-**F7 — O(N²) append-time dedup.**
-`appendOffloadEntries` (`storage.ts:257`) re-reads and rescans the existing entries on every append to avoid duplicate ids. Cost grows quadratically in entries per session; for long sessions this is on the hot path of every tool call. Fix: keep an in-memory id set in session state, seeded once on load. Detection: a benchmark asserting append cost is flat in N.
+**F7 — Appending an entry gets slower the longer the session runs.**
+*What goes wrong:* `appendOffloadEntries` (`storage.ts:257`) re-reads and rescans every existing entry on each append, in order to reject duplicate ids. Total cost across a session therefore grows with the square of the entry count, and this happens on the path taken by every single tool call.
+*Root cause:* a uniqueness check implemented against durable storage rather than against an in-memory index. Correct, but priced per call at the size of the whole history.
+*Fix:* hold the id set in session state, seeded once when the session loads, and consult that instead.
+*Test:* a benchmark asserting per-append cost is flat as N grows from 10 to 1000, rather than rising with N.
 
-**F16 — Message fingerprint is a 200-character prefix hash.**
-`_msgFingerprint` (`src/offload/index.ts:123`) hashes role plus the first 200 characters. Long tool results routinely share their first 200 characters (a JSON envelope, a log preamble), so distinct messages collide and are treated as identical for change detection. Same class of defect as F8, different site; fix identically with a full-content digest. Detection: two messages with a shared 200-char prefix must produce distinct fingerprints.
+**F16 — Two different messages can be treated as the same message.**
+*What goes wrong:* `_msgFingerprint` (`src/offload/index.ts:123`) hashes the role plus the first 200 characters of content. Long tool results routinely share their opening 200 characters — a JSON envelope, a log preamble, a repeated header — so genuinely distinct messages produce identical fingerprints and change detection concludes nothing moved.
+*Root cause:* identical to F8: a cheap prefix-based fingerprint applied to data whose variation lives past the prefix. Listing it separately because it is a different call site with a different blast radius.
+*Fix:* full-content digest, sharing the implementation introduced by E1.
+*Test:* two messages sharing a 200-character prefix must produce different fingerprints.
 
-**F17 — The canvas file is re-read on every tool call.**
-`after-tool-call.ts:207` calls `readMmd` per tool call. On a tool-heavy turn this is repeated synchronous I/O for a file that changes only when L2 runs. Fix: cache in session state, invalidate on the L2 write (which becomes an explicit versioned commit under §4.3). Detection: count filesystem reads across a ten-tool turn.
+**F17 — The canvas file is read from disk on every single tool call.**
+*What goes wrong:* `after-tool-call.ts:207` calls `readMmd` once per tool call. On a turn with a dozen tool calls, that is a dozen synchronous reads of a file whose contents only change when the L2 stage runs — which is far less often.
+*Root cause:* no cache, because there was no clear invalidation point. Once L2 writes become explicit versioned commits under §4.3, the invalidation point becomes obvious.
+*Fix:* cache the canvas in session state and invalidate it on the L2 commit.
+*Test:* count filesystem reads across a ten-tool-call turn; expect one, not ten.
 
-**F14 — Hardcoded OpenClaw paths in compaction.**
-`compact()` resolves host paths by string construction (`src/offload/index.ts:2170`, `:2178-2179`). This is what makes the offload engine unusable outside one host, and it is a bug rather than a design choice because the same file already receives a runtime context capable of supplying those paths. Fix: resolve through the adapter (§4.3). Detection: the offload engine runs to completion in a test harness with no OpenClaw installation — currently impossible, which is itself the finding.
+**F14 — The compaction path can only run inside one specific host.**
+*What goes wrong:* `compact()` builds host filesystem paths by string concatenation (`src/offload/index.ts:2170`, `:2178-2179`), assuming an OpenClaw installation laid out a particular way.
+*Root cause:* this is a bug rather than a deliberate design choice, and the reason is specific: the same file already receives a runtime context that is capable of supplying those paths. The information was available and was not used.
+*Fix:* resolve all host paths through the adapter defined in §4.3.
+*Test:* run the offload engine to completion in a test harness with no OpenClaw installation present. That this is currently impossible is itself the finding — the inability to write the test is the evidence.
 
-### 5.4 Fix ordering
+### 5.4 What has to be fixed before what
 
-The dependency structure, stated so the roadmap in §7 is not free to reorder arbitrarily:
+Most of these fixes are independent and can land in any order. Four dependencies are not optional, and they are listed here so that §7's phase ordering is constrained by something other than preference.
 
-- **F1 → E1 → E8 → E2.** Content-addressed refs are a prerequisite for a trustworthy `expand()`, which is the only source of the re-access signal E2 learns from. Building E2 on colliding refs would train a policy on corrupted labels.
-- **F4 → E3.** A typed task graph indexed by positional boundaries inherits F4's renumbering bug.
-- **F2 → §4.1.** The fake revert is worth patching immediately *and* disappears under the plan-not-mutate model; do both, in that order, because the patch is what makes the migration measurable.
-- **F11, F18 → §6.** Two of the metrics in §6 are uncomputable until these two error conditions stop masquerading as empty results. They are therefore Phase 0 work, not Phase 1 work.
-
-Everything else is independent and can land in any order.
+- **F1 must precede E1, which must precede E8, which must precede E2.** E2 learns an eviction policy from a signal: which archived content the model later asked to see again. That signal is collected by `expand()` (E8), and `expand()` can only be trusted once refs are content-addressed (E1), which requires fixing the filename collision (F1). Skipping ahead means training a policy on labels that are silently wrong — the worst possible failure mode, because the model will still produce a plausible-looking policy.
+- **F4 must precede E3.** E3 builds a typed task graph. If that graph is still indexed by positional boundaries, it inherits F4's renumbering bug wholesale, and a typed structure with corrupt indices is harder to debug than an untyped one.
+- **F2 should be patched before the §4.1 migration, even though §4.1 makes it moot.** The fake revert disappears entirely once compression becomes a proposal instead of an in-place edit. Patch it anyway, first — because the patched version emits a `revert_failed` counter, and that counter is how the migration gets measured. Fixing it later means migrating blind.
+- **F11 and F18 must land in Phase 0, not Phase 1.** Two metrics in §6 cannot be computed at all while these two error conditions are indistinguishable from empty results. They are measurement infrastructure, not bug fixes, and Phase 0's whole purpose is measurement.
 
 ---
 
 ## 6. Metrics and success criteria
 
-Separate from the roadmap on purpose. §7 says *when* things happen; this section says *what would have to be true* for any of it to count. If a mechanism in §3 cannot be evaluated against something here, it does not ship.
+This section is deliberately separate from the roadmap. §7 answers *when* things happen. This section answers a different and harder question: *what would have to be true for any of it to count as an improvement?* The rule is simple — if a mechanism in §3 cannot be evaluated against something listed here, it does not ship.
+
+The section is organised in three layers, and the ordering is a dependency, not a preference:
+
+- **Layer 0** is about whether measurement is possible at all. Can the same input be replayed and produce the same output? Do error conditions leave any trace? Until these hold, every number below is a story rather than a measurement.
+- **Layer 1** measures individual mechanisms. Each metric is attached to a specific §3 proposal and names the failure it would expose.
+- **Layer 2** measures the whole system against benchmarks, with the specific requirement that there be a fair control to compare against.
+
+§6.5 then covers the ways this kind of measurement usually goes wrong, and what is being done to avoid each one.
 
 ### 6.1 The measurement problem this repo has today
 
-The README reports four benchmark results (`README.md:39-42`): WideSearch 33%→50% with tokens 221.31M→85.64M, SWE-bench 58.4%→64.2% with 3474.1M→2375.4M, AA-LCR 44.0%→47.5% with 112.0M→77.3M, and PersonaMem 48%→76%. These are the right benchmarks and they are real end-to-end numbers. They are also, for engineering purposes, nearly unusable:
+The README reports four benchmark results (table at `README.md:38-43`, data rows `:40-43`): WideSearch 33%→50% with tokens 221.31M→85.64M, SWE-bench 58.4%→64.2% with 3474.1M→2375.4M, AA-LCR 44.0%→47.5% with 112.0M→77.3M, and PersonaMem 48%→76%. These are the right benchmarks and they are real end-to-end numbers. They are also, for engineering purposes, nearly unusable:
 
 - They compare *plugin on* vs *plugin off*. They cannot attribute a delta to L1 summarisation vs the L2 canvas vs L3 cascade vs long-term recall, so no individual mechanism in this plan can be credited or blamed.
 - There is no compaction control arm. "Better than nothing" is not the relevant comparison when the host itself ships a compaction strategy [11].
@@ -826,64 +898,69 @@ The README reports four benchmark results (`README.md:39-42`): WideSearch 33%→
 
 So the first success criterion is not a number. It is: **the same transcript, replayed twice, produces byte-identical plans.** Everything else is built on that.
 
-### 6.2 Layer 0 — Determinism and instrumentation gates
+### 6.2 Layer 0 — Can anything be measured at all?
 
-Binary, and they gate everything downstream.
+These three gates are pass/fail, and they block everything downstream. They are not metrics; they are the preconditions for having metrics.
 
-| Gate | Criterion |
-| --- | --- |
-| **Replay determinism** | With injected `Clock`/`IdGen` (§4.3), replaying a recorded transcript twice yields identical `ContextPlan.ops` and identical stored artefacts. |
-| **Attribution** | Every op in a plan carries the rule that produced it (`PlanTrace`, §4.1), so token savings can be decomposed by mechanism. |
-| **Error visibility** | `l1_parse_failure_rate` (F11), `recall_timeout` (F18), `revert_failed` (F2), `degraded_entry_rate` (E9), `unmapped_node_rate` (F5) all emit. Today all five are zero-by-construction — not because the conditions do not occur, but because the code returns a success-shaped value. |
-
-Until these hold, every other number in this section is an anecdote.
-
-### 6.3 Layer 1 — Mechanism metrics
-
-These are the metrics individual §3 items are judged on. Each names the mechanism it scores and the failure it would expose.
-
-**Compression / short-term**
-
-| Metric | Definition | Why it exists |
+| Gate | What must be true | Why it is a gate and not a nice-to-have |
 | --- | --- | --- |
-| `context_tokens_per_turn` | Tokens sent to the model, measured with the harness's counter (§4.2) | The headline cost number, now attributable per-rule |
-| `wrong_replacement_rate` | Fraction of replaced blocks whose content is re-accessed within the same session, via `expand()` | **The central metric for E2.** A replacement followed by a re-access was a mistake by definition. Currently unmeasurable — no code path observes re-access (Q6) |
-| `repeat_after_replacement` | Fraction of replacements followed by re-execution of an equivalent tool call | E2's second label channel; also E2's falsifier lives here |
-| `recovery_success_rate` | `expand()` calls returning verified-correct bytes | F1's correctness, measured rather than assumed |
-| `plan_apply_divergence` | Ops proposed vs ops the harness applied | The risk §4.1 accepts, made visible |
+| **Replay determinism** | Replay a recorded transcript twice, with `Clock` and `IdGen` injected (§4.3), and get identical `ContextPlan.ops` and identical stored files. | Without this, comparing two versions of the code compares two different experiments. Any difference could be the change or could be the clock. |
+| **Attribution** | Every operation in a plan records which rule produced it (`PlanTrace`, §4.1). | Otherwise a token saving is a single aggregate number with no way to tell which mechanism earned it — which means no mechanism can be individually kept or cut. |
+| **Error visibility** | Five counters must actually fire: `l1_parse_failure_rate` (F11), `recall_timeout` (F18), `revert_failed` (F2), `degraded_entry_rate` (E9), `unmapped_node_rate` (F5). | Today all five would read zero, and not because the conditions never occur. They read zero because the code returns a value that *looks* like success in each case. A metric that cannot leave zero is worse than no metric, because it reads as reassurance. |
 
-**Canvas / task state**
+### 6.3 Layer 1 — Measuring individual mechanisms
 
-| Metric | Definition | Why it exists |
+Each metric below is tied to a specific proposal from §3 or a specific finding from §2. The third column is the important one: it says what failure the metric would catch, which is the only reason to collect it.
+
+**Short-term memory and compression**
+
+| Metric | How it is computed | What it would catch |
 | --- | --- | --- |
-| `canvas_entity_retention` | Fraction of entities present in canvas version *n* still present in *n+1*, excluding explicit deletes | Direct measurement of ACE-style context collapse [7]. `file_action: "write"` (`l2-prompt.ts:38-52`) makes wholesale loss a single-token decision |
-| `canvas_fidelity` | Sampled audit: node summaries regenerated from refs vs stored summaries, scored for divergence | E7's signal; doc 13's >15% drift threshold is the action line |
-| `mapping_coverage` / `unmapped_node_rate` | Real mapping coverage, with fabrication removed (F5) | The prompt currently demands 100% and the code manufactures it; this measures the true rate |
-| `canvas_write_conflicts` | CAS rejections on `writeGraph` | E3's two-writer safety, observable |
+| `context_tokens_per_turn` | Total tokens sent to the model, counted with the harness's own tokeniser (§4.2) | The headline cost number. Now decomposable per rule, so a saving can be traced to the mechanism that produced it |
+| `wrong_replacement_rate` | Of the blocks the system replaced with a summary, what fraction did the model later ask to see in full via `expand()`, in the same session | **The central metric for E2.** If content was replaced and then needed again, the replacement was a mistake — by definition, with no judgement call required. This is unmeasurable today because nothing in the codebase observes re-access at all (Q6) |
+| `repeat_after_replacement` | Of the blocks replaced, what fraction were followed by the model re-running an equivalent tool call | E2's second and independent evidence channel. E2's stated falsifier is defined on this number |
+| `recovery_success_rate` | Of `expand()` calls, what fraction return bytes that verify against their stored digest | Turns F1's correctness from an assumption into an observation |
+| `plan_apply_divergence` | Operations the library proposed, versus operations the harness actually applied | §4.1 deliberately gives the harness the right to ignore the plan. This measures how often it does, which is the cost of that decision |
 
-**Retrieval / long-term**
+**The task canvas**
 
-| Metric | Definition | Why it exists |
+| Metric | How it is computed | What it would catch |
 | --- | --- | --- |
-| `instruction_survival_rate` | Fraction of active standing instructions present in context when relevant | **Q4's metric.** An instruction evicted by an FCFS char budget (`auto-recall.ts:708-761`) is a silent policy violation |
-| `recall_precision@k` / `recall_hit_rate` | On a labelled set, per class (instruction/fact/episode/scene/persona) | Per-class because E5's whole claim is that one pool is wrong |
-| `stale_fact_rate` | Retrieved facts contradicted by a later record | Q5 — no supersession exists today |
-| `entity_merge_error_rate` | Scene merges joining records with no co-occurrence support | Q3's metric and E6's acceptance test |
-| `evidence_conservation` | L1 records referenced before a scene op vs after | E6's invariant, stated as a measurement |
+| `canvas_entity_retention` | Of the entities present in canvas version *n*, what fraction survive into version *n+1*, excluding entities that were explicitly deleted | This is the direct measurement of ACE-style context collapse [7] — the failure where a rewrite quietly drops most of what was there. It matters here specifically because `file_action: "write"` (`l2-prompt.ts:38-52`) lets the model discard the entire canvas by emitting one token |
+| `canvas_fidelity` | Take a sample of node summaries, regenerate each from its source refs, and score how far the regenerated version diverges from the stored one | E7's signal. Doc 13's threshold of 15% drift is the point at which a rebuild is triggered rather than reported |
+| `mapping_coverage` and `unmapped_node_rate` | What fraction of tool calls have a genuine node attribution, with F5's fabricated ones removed | The prompt currently demands 100% coverage and the code manufactures whatever the model failed to supply. This measures the real rate for the first time |
+| `canvas_write_conflicts` | How often a `writeGraph` commit is rejected because the canvas changed underneath it | Makes E3's two-writer safety observable instead of assumed. A conflict is a *success* of the mechanism; zero conflicts forever would suggest the check is not wired in |
+
+**Long-term memory and retrieval**
+
+| Metric | How it is computed | What it would catch |
+| --- | --- | --- |
+| `instruction_survival_rate` | Of the standing instructions that are currently in force, what fraction are actually present in the context when they are relevant | **This is Q4's metric.** An instruction dropped by the first-come-first-served character budget (`auto-recall.ts:708-761`) is a silent policy violation — the user's stated rule stops being followed and nothing reports it |
+| `recall_precision@k` and `recall_hit_rate` | Standard retrieval metrics on a labelled set, computed **separately for each class**: instruction, fact, episode, scene, persona | Computed per class because E5's entire claim is that pooling these into one ranked list is the error. A single aggregate number would hide precisely the effect being tested |
+| `stale_fact_rate` | Of the facts retrieved, what fraction are contradicted by a more recent record | Q5. Today nothing supersedes anything, so an old fact and its correction compete on similarity score alone |
+| `entity_merge_error_rate` | Of the scene merges performed, what fraction join records that never co-occur in the underlying L1 data | Q3's metric, and E6's acceptance test. A merge with no co-occurrence support is a name collision, not a real identity |
+| `evidence_conservation` | Count the L1 records reachable from a scene before a scene operation and after it | E6's core invariant expressed as a number. A merge or split may reorganise evidence; it may never lose it |
 
 **Cost and latency**
 
-`llm_calls_per_turn` and `llm_tokens_per_turn` broken out by pipeline stage (L1/L1.5/L2/L3/scene/persona); `p50`/`p95` added latency on `before_prompt_build` against the 5s budget (`config.ts:95`); background queue depth and drain time at session end (`BG_DRAIN_TIMEOUT_MS`, `tdai-core.ts:193`); `storage_io_per_turn` (F7, F17).
+Four families of number, all broken out rather than aggregated:
 
-### 6.4 Layer 2 — End-to-end criteria
+- `llm_calls_per_turn` and `llm_tokens_per_turn`, split by pipeline stage — L1, L1.5, L2, L3, scene, persona — because §2 found the cost is very unevenly distributed and an aggregate hides that.
+- Added latency on `before_prompt_build` at p50 and p95, measured against the configured 5-second budget (`config.ts:95`). p95 rather than average, because this sits on the path of every turn and the tail is what users notice.
+- Background queue depth, and how long the queue takes to drain at session end, against `BG_DRAIN_TIMEOUT_MS` (`tdai-core.ts:193`). A queue that does not drain in time is silent data loss.
+- `storage_io_per_turn` — filesystem operations per turn, which is what F7 and F17 are about.
 
-Run against the four benchmarks the README already uses, with **three arms**, which is the change that matters:
+### 6.4 Layer 2 — Measuring the whole system
 
-1. **Off** — no memory layer.
-2. **Host-native compaction** — the control arm §3.1 adopts. Without it, "the canvas helps" is unfalsifiable.
-3. **This system** — at whichever phase is being evaluated.
+Run the same four benchmarks the README already uses, but with **three arms instead of two**. The third arm is the change that matters:
 
-Success criteria, stated as thresholds rather than hopes:
+1. **Off** — no memory layer at all.
+2. **Host-native compaction** — whatever compaction the host already ships [11]. This is the control arm adopted in §3.1. Without it, the claim "the canvas helps" cannot be falsified, because the only alternative it is being compared against is doing nothing.
+3. **This system** — at whichever phase is currently being evaluated.
+
+The reason arm 2 is non-negotiable: a memory system that beats "no memory" but loses to the host's built-in compaction is a net negative, and a two-arm comparison would report it as a win.
+
+Success criteria, stated as thresholds so that passing and failing are decidable in advance:
 
 - **No regression floor.** No benchmark success rate may fall below the current measured baseline at any phase boundary. This is a hard gate, checked per phase.
 - **Attribution requirement.** Any claimed token reduction must decompose across `PlanTrace` rules summing to within 5% of the observed total. A saving nobody can attribute is treated as unexplained and blocks the phase.
@@ -903,14 +980,33 @@ Doc 33's AIDE² result — that a large majority of self-proposed improvements a
 
 ## 7. Step 6 — Phased roadmap
 
-No time estimates. Phases are ordered by dependency, and by the rule that **fixes come before step-changes**. Where that rule is broken, the deviation is stated and justified on the spot. Every phase has an entry condition, an exit condition that is a test or a measurement rather than a judgement call, and — for `step-change` work — a rollback path that gets exercised rather than merely described.
+No time estimates anywhere in this section. Phases are ordered by what depends on what, plus one rule: **fixes come before step-changes.** There are two places where that rule is broken, and both are called out where they occur rather than quietly absorbed.
+
+Every phase below is described with the same five headings, and it is worth being explicit about what each one means:
+
+- **Scope** — what actually gets built.
+- **Dependencies** — what must already be true, and *why* it must be true. A dependency without a reason is a preference.
+- **Ambition tiers delivered** — which of the `fix` / `increment` / `step-change` categories from §0.1 this phase ships. Present so that a phase cannot quietly consist entirely of the exciting work.
+- **Entry and exit criteria** — the entry criterion is what must hold before starting. The exit criterion is a test result or a measured number, never a judgement call like "works well." If an exit criterion cannot be checked by running something, it is not an exit criterion.
+- **Rollback** — how the change gets turned off if it turns out to be wrong. For `step-change` work this must be a path that is actually exercised in CI, not one that merely exists on paper. An untested rollback is not a rollback.
+
+**The sequence in one line each:**
+
+| Phase | Purpose in plain terms |
+| --- | --- |
+| **0** | Find out what the system currently does, precisely enough that later changes can be attributed. Nothing is changed. |
+| **1** | Make the code stop doing things it claims not to do. All of §5's defects. |
+| **2** | Turn the plugin into a library that any harness can use, without changing behaviour. |
+| **3** | Fix retrieval: stop treating a user's standing instruction as a search result competing on similarity. |
+| **4** | Stop asking a language model to maintain a data structure that code can maintain correctly. |
+| **5** | Replace the guessed "how replaceable is this" score with one measured against what the model actually needed later. |
 
 ### Phase 0 — Reproduce and measure the baseline
 
 **No behavioural changes. None.** The only code written in this phase is code that observes.
 
 **Scope**
-- Stand up the three-arm test harness from §6.4 (no memory layer / host-native compaction / current system) on all four benchmarks (`README.md:39-42`), and reproduce the published numbers within noise. If they do not reproduce, that is this phase's finding, and the roadmap stops until it is understood.
+- Stand up the three-arm test harness from §6.4 (no memory layer / host-native compaction / current system) on all four benchmarks (`README.md:40-43`), and reproduce the published numbers within noise. If they do not reproduce, that is this phase's finding, and the roadmap stops until it is understood.
 - Build the transcript recorder and replayer: capture message arrays, tool calls, and tool results, then replay them offline. This is the artefact every later measurement depends on.
 - Inject `Clock` and `IdGen` (§4.3) at the three places that currently read the ambient clock and random source (`storage.ts:527`, `auto-capture.ts:41-43`). This is a pure refactor with no change in behaviour, which is why it is allowed in a no-changes phase.
 - Land the instrumentation gates from §6.2 and the error counters from F11 and F18. These two fixes are prerequisites *for* measurement rather than consequences of it (§5.4).
@@ -935,11 +1031,11 @@ No time estimates. Phases are ordered by dependency, and by the rule that **fixe
 
 ### Phase 1 — Correctness floor
 
-**Scope** — the S1 and S2 fixes from §5 that do not require the SDK refactor: F1 (using E1's content-addressed refs), F2 (the deep-copy patch), F3 with E9, F4 with E4, F5, F6, F8, F10, F12, F13, F16. Plus the two cheap S3 items, F7 and F17, because they reduce measurement noise.
+**Scope** — every defect from §5 in the two serious severity bands (S1: silently wrong data; S2: silent loss) that can be fixed without waiting for the library refactor. Concretely: F1 via E1's content-addressed refs, F2's deep-copy patch, F3 together with E9, F4 together with E4, then F5, F6, F8, F10, F12, F13, F16. Two of the cheaper S3 items, F7 and F17, come along as well — not because they are urgent, but because repeated disk I/O adds variance to every latency measurement the later phases depend on.
 
-**Dependencies** — Phase 0's replay harness. Each fix needs a failing test first, and several of these bugs (F1, F8, F16) are only reliably reproducible with a frozen clock.
+**Dependencies** — Phase 0's replay harness, for a specific reason: every fix here starts with a test that fails, and three of these bugs (F1, F8, F16) can only be reproduced reliably when the clock is frozen. Without the harness, they can be reasoned about but not demonstrated.
 
-**Ambition tiers** — all `fix`, plus one `increment` (E9). No step-changes.
+**Ambition tiers delivered** — all `fix`, plus a single `increment` (E9). No step-changes, by design. This phase exists to make the floor solid.
 
 **Entry** — Phase 0's exit criteria hold.
 
@@ -954,11 +1050,19 @@ No time estimates. Phases are ordered by dependency, and by the rule that **fixe
 
 ### Phase 2 — The SDK boundary
 
-**Scope** — all of §4. `createMemory`/`Session`/`ContextPlan`, the four adapters, and the plan-instead-of-mutate migration. Delete the exclusive context-engine claim (`src/offload/index.ts:1228-1234`) and the module-level singletons (`:75-95`). Fix F14's hardcoded paths and F15's hardcoded strings. Ship F9's real tool budget together with E8's `expand()`. The OpenClaw plugin is rewritten as the thin adapter shown in §4.5(c).
+**Scope** — all of §4, which means five distinct pieces of work:
 
-**Dependencies** — Phase 1. Moving buggy behaviour to a new boundary preserves the bugs and makes them harder to find. E1 (Phase 1) is also a hard prerequisite for E8.
+1. The public API — `createMemory`, `Session`, `ContextPlan` — and the switch from editing the harness's message array to returning a plan the harness applies (§4.1).
+2. The four pluggable adapters (storage, LLM, embedding, clock/id).
+3. Removing the two things that make the current code un-embeddable: the exclusive claim on the host's context-engine slot (`src/offload/index.ts:1228-1234`) and the module-level singletons (`:75-95`).
+4. F14's hardcoded host paths and F15's hardcoded model-facing strings, both of which are portability blockers rather than cosmetic.
+5. E8's `expand()` together with F9's actual tool-call budget, since the budget is meaningless without something to budget.
 
-**Ambition tiers** — one `increment` (E8), plus a large structural refactor that is not itself a memory mechanism. It sits here rather than later because E2, E3, E5, and E6 all need the boundary: E2 needs `expand()`'s re-access events, E3 needs a versioned `writeGraph`, E5 needs a per-class recall budget that the current API cannot express.
+The existing OpenClaw plugin is then rewritten as the thin adapter sketched in §4.5(c) — it becomes one consumer of the library rather than the library's only possible home.
+
+**Dependencies** — Phase 1, and the reason is not scheduling convenience. Moving buggy behaviour behind a new abstraction boundary does not fix the bugs; it hides them, because the boundary now sits between the symptom and the cause. Separately, E1 from Phase 1 is a hard prerequisite for E8: an `expand()` built on colliding refs returns wrong content confidently.
+
+**Ambition tiers delivered** — one `increment` (E8), plus a large structural refactor that is not itself a memory mechanism at all. The refactor is scheduled here rather than later because four of the remaining proposals cannot be expressed without it: E2 needs the re-access events that only `expand()` emits, E3 needs a versioned `writeGraph`, E5 needs a per-class recall budget, and E6 needs the atomic commit primitive. None of these are expressible in the current API.
 
 **Entry** — Phase 1's exit criteria hold.
 
@@ -976,9 +1080,9 @@ No time estimates. Phases are ordered by dependency, and by the rule that **fixe
 
 **Scope** — E5 in full (class-partitioned recall, standing-order semantics for instructions, the 25/25/50 budget split, and the `supersede` operation), plus the parts of E6 that are pure hygiene: the `SceneOp` schema, evidence conservation, and the atomic directory rename that replaces the current backup-and-restore dance (`scene-extractor.ts:140`, `:227`).
 
-**Dependencies** — Phase 2's per-class recall API. This phase comes deliberately *before* the compression step-changes, for two reasons: Q4 (a standing instruction silently evicted by a character budget) is a policy violation wearing a feature's clothing, and retrieval changes are far easier to attribute than compression changes.
+**Dependencies** — Phase 2's per-class recall API. This phase is placed deliberately *before* the compression step-changes, for two reasons worth stating plainly. First, Q4 is not a quality issue but a correctness one: when a user's standing instruction gets dropped because a character budget filled up in arrival order, the system has stopped following an explicit instruction and reported nothing. That is a policy violation, and it is more urgent than any compression improvement. Second, retrieval changes are much easier to attribute than compression changes — a retrieval result either contains the right item or it does not, whereas a compression change moves an end-to-end score by an amount that is hard to separate from noise.
 
-**Ambition tiers** — one `step-change` (E5) and the fix-shaped half of another (E6). This is the roadmap's one deviation from strict fixes-before-step-changes, and the reason is stated rather than assumed: E5's step-change component is the *semantics* of instructions — standing orders rather than search hits — and that cannot be delivered as a fix, because the current API has nowhere to put it.
+**Ambition tiers delivered** — one `step-change` (E5) and the fix-shaped half of another (E6). This is the roadmap's one deviation from strict fixes-before-step-changes, so here is the justification rather than an assertion that one exists: the step-change part of E5 is a change in *meaning*, not a change in ranking. An instruction stops being a search hit that competes on similarity and becomes a standing order that is either in force or expired. There is no way to ship that as a fix, because the current API has nowhere to represent "in force."
 
 **Entry** — Phase 2's exit criteria hold.
 
@@ -1031,17 +1135,19 @@ No time estimates. Phases are ordered by dependency, and by the rule that **fixe
 
 **Rollback** — three levels, all exercised in CI: learned scorer off (falls back to E2′), E2′ off (falls back to the Phase-1 heuristic), whole cascade off (falls back to host-native compaction). A trained model that cannot be disabled at runtime does not ship.
 
-### 7.1 Why this order
+### 7.1 Why this order, and the specific temptation it resists
 
-The sequence is measurement → correctness → boundary → retrieval → structure → learning. It is chosen so that each phase is evaluated against instrumentation the previous phase made trustworthy.
+The sequence is: measure, then fix, then make it embeddable, then fix retrieval, then fix structure, then learn. The single organising principle is that **each phase is judged against instrumentation the previous phase made trustworthy.** A phase that cannot be measured against a trusted baseline cannot be evaluated, and a change that cannot be evaluated cannot be kept or reverted on evidence.
 
-The temptation is to build E2 early, because it is the most interesting item in §3. Doing that would mean training an eviction policy on re-access labels generated by an `expand()` that does not exist yet, over refs that can silently return the wrong bytes (F1), against a baseline nobody has reproduced. It would produce a number, and the number would mean nothing.
+The temptation this ordering resists is specific and worth naming, because it is the most likely way this plan gets executed badly: build E2 first, because it is the most interesting proposal in §3.
+
+Doing that would mean training an eviction policy on re-access labels produced by an `expand()` that has not been built, reading refs that can silently return the wrong bytes (F1), evaluated against a baseline nobody has reproduced, on runs that are not reproducible because the clock is ambient. The process would complete. It would produce a trained model and a plausible number. The number would carry no information, and — this is the actual danger — nothing in the output would indicate that.
 
 ---
 
 ## 8. Non-goals
 
-Stated explicitly, because each of these is something a reader might reasonably expect from a memory system and will not find here.
+Every item below is something a reader could reasonably expect from a memory system and will not find in this plan. Each one gets a reason, because "out of scope" without a reason is just a refusal.
 
 - **Not an MCP server.** §4.7 gives the reasoning. A thin MCP façade over `expand()` alone would be defensible; it is out of scope here because building it creates pressure to move `plan()` across the same boundary, which is the specific mistake §4 exists to prevent.
 - **Not a hosted service.** The Hermes HTTP gateway (`src/gateway/server.ts:5-11`) stays as-is, a sidecar for one host. No multi-tenant service, no auth model, no rate limiting. Multi-tenancy is a genuinely different problem and pretending otherwise produces a design that serves neither case.
@@ -1057,7 +1163,9 @@ Stated explicitly, because each of these is something a reader might reasonably 
 
 ## 9. Summary of commitments
 
-| Item | Tier | Phase | Falsifier / kill switch |
+One row per item. The last column is the most important one: it states, in advance, the condition under which the item is abandoned or switched off. An item with no such condition is either a straightforward fix (where the failing test is the condition) or it does not belong in this plan.
+
+| Item | Tier | Phase | The condition under which it is abandoned or disabled |
 | --- | --- | --- | --- |
 | F1–F18 error fixes (§5) | `fix` | 0–2 | Failing-test-first for each |
 | E1 content-addressed refs | `fix` | 1 | — |
