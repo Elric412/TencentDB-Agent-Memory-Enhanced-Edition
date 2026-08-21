@@ -12,6 +12,7 @@ import {
   type StorageContext,
 } from "../storage.js";
 import type { OffloadStateManager } from "../state-manager.js";
+import { report } from "../../core/report/reporter.js";
 
 function isHeartbeatEntry(entry: OffloadEntry): boolean {
   try {
@@ -22,22 +23,6 @@ function isHeartbeatEntry(entry: OffloadEntry): boolean {
   }
 }
 
-function hasNullEntryAfterLastL2(
-  nullEntries: OffloadEntry[],
-  lastL2Iso: string,
-): boolean {
-  const lastMs = new Date(lastL2Iso).getTime();
-  if (Number.isNaN(lastMs)) return true;
-  return nullEntries.some((e) => {
-    if (!e.timestamp) return true;
-    const ts = new Date(e.timestamp).getTime();
-    if (Number.isNaN(ts)) return true;
-    return ts > lastMs;
-  });
-}
-
-const MMD_NODE_ID_RE = /\b(\d{3}-N\d+)\b/g;
-
 function normalizeNodeMapping(raw: any): Record<string, string> {
   const out: Record<string, string> = Object.create(null);
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
@@ -47,48 +32,6 @@ function normalizeNodeMapping(raw: any): Record<string, string> {
     if (s) out[k] = s;
   }
   return out;
-}
-
-function extractMmdNodeIdsFromText(text: string | null | undefined): string[] {
-  if (text == null || typeof text !== "string") return [];
-  const seen = new Set<string>();
-  const out: string[] = [];
-  let m: RegExpExecArray | null;
-  MMD_NODE_ID_RE.lastIndex = 0;
-  while ((m = MMD_NODE_ID_RE.exec(text)) !== null) {
-    const id = m[1];
-    if (!seen.has(id)) {
-      seen.add(id);
-      out.push(id);
-    }
-  }
-  return out;
-}
-
-function pickMmdDerivedFallbackNodeId(
-  mmdText: string,
-  mmdPrefix: string,
-): string | null {
-  const ids = extractMmdNodeIdsFromText(mmdText);
-  if (ids.length === 0) return null;
-  const prefix =
-    typeof mmdPrefix === "string" && /^\d{3}$/.test(mmdPrefix)
-      ? `${mmdPrefix}-`
-      : null;
-  const pool = prefix ? ids.filter((id) => id.startsWith(prefix)) : ids;
-  const candidates = pool.length > 0 ? pool : ids;
-  let best: string | null = null;
-  let bestN = -1;
-  for (const id of candidates) {
-    const mm = id.match(/^(\d{3})-N(\d+)$/);
-    if (!mm) continue;
-    const n = Number(mm[2]);
-    if (Number.isFinite(n) && n > bestN) {
-      bestN = n;
-      best = id;
-    }
-  }
-  return best;
 }
 
 // ─── L2 Independent Trigger Check ─────────────────────────────────────────────
@@ -122,8 +65,7 @@ export async function checkL2Trigger(
   const entriesByMmd = new Map<string, OffloadEntry[]>();
   let eligibleNullCount = 0;
 
-  for (let i = 0; i < allEntries.length; i++) {
-    const entry = allEntries[i];
+  for (const entry of allEntries) {
     if (isHeartbeatEntry(entry)) continue;
     if (entry.node_id !== null && entry.node_id !== "wait") continue;
 
@@ -136,8 +78,11 @@ export async function checkL2Trigger(
       }
     }
 
-    // Use boundary to determine which mmd this entry belongs to
-    const boundary = stateManager.resolveEntryBoundary(i);
+    // Resolve the owning boundary by the entry's durable seq, never by list
+    // position: the read path backfills seq onto every entry, and seq stays
+    // attached to its entry across entry-log rewrites that reorder rows.
+    const boundary =
+      typeof entry.seq === "number" ? stateManager.resolveBoundaryForSeq(entry.seq) : null;
     if (!boundary) continue;                       // no boundary coverage → skip
     if (boundary.result !== "long") continue;       // short task → skip
     if (!boundary.targetMmd) continue;              // no target mmd → skip
@@ -173,9 +118,19 @@ export async function checkL2Trigger(
     const elapsed = (Date.now() - new Date(lastL2Time).getTime()) / 1000;
     if (elapsed >= timeoutSeconds) {
       if (timeNeedsNewOffload) {
-        // Check if any null entry is newer than last L2
-        const nullEntries = allEntries.filter((e) => e.node_id === null && !isHeartbeatEntry(e));
-        if (!hasNullEntryAfterLastL2(nullEntries, lastL2Time) && totalEligible === eligibleNullCount) {
+        // Seq-based "new offload" test: only null entries beyond the seq
+        // cursor of the last L2 pass count as new work. Entry timestamps are
+        // not reliable for this — equal-millisecond writes or clock skew can
+        // hide genuinely new rows, while seq is assigned monotonically at
+        // append time.
+        const lastProcessedSeq = stateManager.getLastProcessedSeq();
+        const hasNewRows = allEntries.some(
+          (e) =>
+            e.node_id === null &&
+            !isHeartbeatEntry(e) &&
+            (lastProcessedSeq === null || (typeof e.seq === "number" && e.seq > lastProcessedSeq)),
+        );
+        if (!hasNewRows && totalEligible === eligibleNullCount) {
           return { ...emptyResult, reason: "timeout but no new offload rows" };
         }
       }
@@ -217,69 +172,63 @@ export async function checkL2Trigger(
   };
 }
 
+/**
+ * Apply the model's `node_mapping` to "wait" entries — and nothing more.
+ *
+ * The guessing heuristic is deleted, not improved (Plan.md): when the model
+ * omits a tool call from `node_mapping`, there is no better guess available,
+ * only a more convincing one. Unmapped wait entries are therefore reset to
+ * `node_id: null` (so they become eligible for a future L2 pass again) and
+ * their count is surfaced as the `unmapped` metric / `unmapped_node_rate`
+ * report event. No node id ever appears in the output that was not present in
+ * the model's response.
+ *
+ * @returns `{ mapped, unmapped }` counts for the caller and for metrics.
+ */
 export async function backfillNodeIds(
   ctx: StorageContext,
   nodeMapping: Record<string, string>,
   waitIds: Set<string>,
   logger: PluginLogger,
-  options?: { mmdFallbackText?: string | null; mmdPrefix?: string },
-): Promise<void> {
+): Promise<{ mapped: number; unmapped: number }> {
   const mapping = normalizeNodeMapping(nodeMapping);
-  const mmdFallbackText = options?.mmdFallbackText ?? null;
-  const mmdPrefix = options?.mmdPrefix ?? "000";
   const allEntries = await readAllOffloadEntries(ctx);
   let changed = false;
-  const mappedNodeIds = Object.values(mapping);
-  const fallbackFromMapping = getMostFrequent(mappedNodeIds);
-  const fallbackFromMmd = pickMmdDerivedFallbackNodeId(
-    mmdFallbackText ?? "",
-    mmdPrefix,
-  );
-  const effectiveFallback = fallbackFromMapping || fallbackFromMmd;
 
   let mappedCount = 0;
-  let fallbackCount = 0;
-  let skippedCount = 0;
+  let unmappedCount = 0;
 
   for (const entry of allEntries) {
     const mapped = mapping[entry.tool_call_id];
     if (mapped) {
+      if (entry.node_id !== mapped) changed = true;
       entry.node_id = mapped;
-      changed = true;
       mappedCount++;
       continue;
     }
     if (entry.node_id === "wait" && waitIds.has(entry.tool_call_id)) {
-      if (effectiveFallback) {
-        entry.node_id = effectiveFallback;
-        changed = true;
-        fallbackCount++;
-      } else {
-        skippedCount++;
-      }
+      // Gap in the model's response: leave the entry honestly unmapped (null)
+      // instead of fabricating an attribution. It becomes eligible for the
+      // next L2 pass via the null-entry trigger again.
+      entry.node_id = null;
+      changed = true;
+      unmappedCount++;
     }
   }
   if (changed) {
     await rewriteAllOffloadEntries(ctx, allEntries);
   }
-  logger.debug?.(`[context-offload] L2 backfill: mapped=${mappedCount}, fallback=${fallbackCount} (to ${effectiveFallback ?? "N/A"}), skipped=${skippedCount}, total=${waitIds.size}`);
-}
-
-function getMostFrequent(arr: string[]): string | null {
-  if (arr.length === 0) return null;
-  const freq = new Map<string, number>();
-  for (const v of arr) {
-    freq.set(v, (freq.get(v) ?? 0) + 1);
+  if (unmappedCount > 0) {
+    report("unmapped_node_rate", {
+      source: "l2_backfill",
+      mapped: mappedCount,
+      unmapped: unmappedCount,
+      total: waitIds.size,
+      sessionId: ctx.sessionId,
+    });
   }
-  let maxKey = arr[0];
-  let maxCount = 0;
-  for (const [key, count] of freq) {
-    if (count > maxCount) {
-      maxCount = count;
-      maxKey = key;
-    }
-  }
-  return maxKey;
+  logger.debug?.(`[context-offload] L2 backfill: mapped=${mappedCount}, unmapped=${unmappedCount}, total=${waitIds.size}`);
+  return { mapped: mappedCount, unmapped: unmappedCount };
 }
 
 // Local runL2Pipeline removed — all L2 processing goes through backend (index.ts → backendClient.l2Generate).

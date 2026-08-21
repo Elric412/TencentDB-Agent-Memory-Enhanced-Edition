@@ -51,6 +51,12 @@ export interface L0MessageRecord {
   role: "user" | "assistant";
   content: string;
   timestamp: number; // epoch ms
+  /**
+   * Explicit turn outcome — "success" (default) or "error". A failed
+   * turn is high-value memory ("we tried X and it did not work"), so it is
+   * captured and labelled rather than filtered out before extraction sees it.
+   */
+  outcome?: "success" | "error";
 }
 
 /**
@@ -103,8 +109,10 @@ export async function recordConversation(params: {
    * AFTER before_prompt_build, i.e. the one whose content was polluted by prependContext.
    */
   originalUserMessageCount?: number;
+  /** Turn outcome — "error" for failed turns, defaults to "success". */
+  outcome?: "success" | "error";
 }): Promise<ConversationMessage[]> {
-  const { sessionKey, sessionId, rawMessages, baseDir, logger, originalUserText, afterTimestamp, originalUserMessageCount } = params;
+  const { sessionKey, sessionId, rawMessages, baseDir, logger, originalUserText, afterTimestamp, originalUserMessageCount, outcome } = params;
 
   // Step 1: Position slice + extract user/assistant messages.
   //
@@ -274,6 +282,7 @@ export async function recordConversation(params: {
       role: msg.role,
       content: msg.content,
       timestamp: msg.timestamp,
+      outcome: outcome ?? "success",
     };
     lines.push(JSON.stringify(record));
   }

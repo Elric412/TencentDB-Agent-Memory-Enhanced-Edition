@@ -35,6 +35,7 @@ import { registerMemoryTdaiCli } from "./src/cli/index.js";
 import { initDataDirectories, resetStores } from "./src/utils/pipeline-factory.js";
 import { getOrCreateInstanceId, initReporter, report, resetReporter } from "./src/core/report/reporter.js";
 import { ensureL2L3Local } from "./src/core/profile/profile-sync.js";
+import { MemoryToolCallLimiter } from "./src/core/tools/tool-call-limiter.js";
 
 // Core abstractions (host-neutral)
 import { OpenClawHostAdapter } from "./src/adapters/openclaw/host-adapter.js";
@@ -77,6 +78,8 @@ const pendingRecallCache = new Map<string, {
   l3Persona: string | null;
   strategy: string;
   durationMs: number;
+  /** True when the recall slot was consumed by a timeout, not a real retrieval. */
+  timedOut?: boolean;
   ts: number;
 }>();
 
@@ -347,7 +350,8 @@ export default function register(api: OpenClawPluginApi) {
   // ============================
 
   // tdai_memory_search — Agent-callable L1 memory search tool
-  // TODO: implement hard per-turn call limit via before_tool_call hook + execute early-return (方案 D)
+  // Hard per-turn call limit enforced via before_tool_call hook below
+  // (MemoryToolCallLimiter, src/core/tools/tool-call-limiter.ts)
   if (cfg.recall.enabled || cfg.capture.enabled) {
   api.registerTool(
     {
@@ -435,7 +439,7 @@ export default function register(api: OpenClawPluginApi) {
   );
 
   // tdai_conversation_search — Agent-callable L0 conversation search tool
-  // TODO: implement hard per-turn call limit via before_tool_call hook + execute early-return (方案 D)
+  // Hard per-turn call limit enforced via before_tool_call hook below
   api.registerTool(
     {
       name: "tdai_conversation_search",
@@ -515,6 +519,17 @@ export default function register(api: OpenClawPluginApi) {
     },
     { name: "tdai_conversation_search" },
   );
+
+  // Enforce the combined per-turn call limit stated in the tool
+  // descriptions. A shared counter across both memory tools, checked in
+  // before_tool_call; the 4th call in one turn is refused with a
+  // structured, model-readable blockReason and a tool_call_limit_block
+  // metric event. Turn identity: runId when the host provides one,
+  // otherwise per-sessionKey.
+  const memoryToolCallLimiter = new MemoryToolCallLimiter(cfg.recall.memoryToolCallLimit ?? 3);
+  api.on("before_tool_call", (event: { toolName?: string; runId?: string }, ctx: { sessionKey?: string; runId?: string }) => {
+    return memoryToolCallLimiter.beforeToolCall(event ?? {}, ctx ?? {});
+  });
   } else {
     api.logger.debug?.(`${TAG} Memory tools (tdai_memory_search, tdai_conversation_search) not registered — memory features disabled`);
   }
@@ -568,13 +583,17 @@ export default function register(api: OpenClawPluginApi) {
         const elapsedMs = Date.now() - startMs;
         const recallDurationMs = Date.now() - recallStartMs;
 
-        // Cache recall results for agent_turn metric (retrieved at agent_end)
+        // Cache recall results for agent_turn metric (retrieved at agent_end).
+        // A timed-out recall still gets cached — with timedOut=true and empty
+        // memories — so agent_turn can report it as a timeout rather than an
+        // empty retrieval (a miss). The two have different remedies.
         if (sessionKey && result) {
           pendingRecallCache.set(sessionKey, {
             l1Memories: result.recalledL1Memories ?? [],
             l3Persona: result.recalledL3Persona ?? null,
-            strategy: result.recallStrategy ?? "unknown",
+            strategy: result.timedOut ? "timeout" : (result.recallStrategy ?? "unknown"),
             durationMs: recallDurationMs,
+            timedOut: result.timedOut === true,
             ts: Date.now(),
           });
         }
@@ -658,9 +677,13 @@ export default function register(api: OpenClawPluginApi) {
       api.logger.debug?.(`${TAG} [agent_end] Hook triggered`);
 
       const e = event as Record<string, unknown>;
+      // A failed turn is high-value memory ("we tried X and it did not
+      // work"). Capture it with an explicit outcome instead of treating the
+      // failure as if the turn never happened. L1 extraction decides what to
+      // do with the failure downstream.
+      const turnOutcome: "success" | "error" = e.success ? "success" : "error";
       if (!e.success) {
-        api.logger.info(`${TAG} [agent_end] Agent did not succeed, skipping capture`);
-        return;
+        api.logger.info(`${TAG} [agent_end] Agent did not succeed — capturing turn with outcome="error"`);
       }
 
       const sessionKey = ctx.sessionKey;
@@ -708,6 +731,7 @@ export default function register(api: OpenClawPluginApi) {
           sessionId: sessionId || undefined,
           startedAt: pluginStartTimestamp,
           originalUserMessageCount: cachedPrompt?.messageCount,
+          outcome: turnOutcome,
         });
         const captureMs = Date.now() - startMs;
         api.logger.info(
@@ -729,6 +753,9 @@ export default function register(api: OpenClawPluginApi) {
             recalledL3Persona: cachedRecall?.l3Persona ?? null,
             recallStrategy: cachedRecall?.strategy ?? null,
             recallDurationMs: cachedRecall?.durationMs ?? 0,
+            // True when recall timed out — the empty recall lists above then
+            // mean "index too slow", not "index has nothing relevant".
+            recallTimedOut: cachedRecall?.timedOut === true,
             l0CapturedMessages: captureResult.filteredMessages.map((m) => ({
               role: m.role,
               content: m.content,

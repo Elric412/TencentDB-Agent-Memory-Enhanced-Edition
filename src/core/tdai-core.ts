@@ -280,6 +280,9 @@ export class TdaiCore {
       vectorStore: this.vectorStore,
       embeddingService: this.embeddingService,
       bgTaskRegistry: this.bgTasks,
+      // Propagate the turn outcome so failed turns are captured and
+      // labelled rather than dropped.
+      outcome: turn.outcome,
     });
   }
 

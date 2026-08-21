@@ -66,6 +66,8 @@ export async function performAutoCapture(params: {
   vectorStore?: IMemoryStore;
   /** EmbeddingService for L0 vector indexing (optional). */
   embeddingService?: EmbeddingService;
+  /** Turn outcome — "error" for failed turns, defaults to "success". */
+  outcome?: "success" | "error";
   /**
    * Tracks in-flight fire-and-forget background tasks started by this
    * capture (currently: deferred L0 embedding for SQLite-style stores).
@@ -86,7 +88,7 @@ export async function performAutoCapture(params: {
   const {
     messages, sessionKey, sessionId, cfg, pluginDataDir, logger, scheduler,
     originalUserText, originalUserMessageCount, pluginStartTimestamp,
-    vectorStore, embeddingService, bgTaskRegistry,
+    vectorStore, embeddingService, bgTaskRegistry, outcome,
   } = params;
   const tCaptureStart = performance.now();
 
@@ -125,6 +127,7 @@ export async function performAutoCapture(params: {
           originalUserText,
           afterTimestamp,
           originalUserMessageCount,
+          outcome,
         });
 
         if (filteredMessages.length === 0) {
