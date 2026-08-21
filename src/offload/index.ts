@@ -59,6 +59,7 @@ import { sanitizeText, writeRefMd } from "./storage.js";
 import { listMmds, readMmd, writeMmd, patchMmd } from "./storage.js";
 import {
   appendOffloadEntries,
+  peekNextSeq,
   rewriteAllOffloadEntries,
 } from "./storage.js";
 import { nowChinaISO } from "./time-utils.js";
@@ -67,6 +68,8 @@ import { SessionRegistry } from "./session-registry.js";
 import { reclaimOffloadData } from "./reclaimer.js";
 import { buildL3TriggerReport, reportL3Trigger } from "./state-reporter.js";
 import { resolveUserId, getUserIdSource } from "./user-id.js";
+import { report } from "../core/report/reporter.js";
+import { DegradedRetryQueue } from "./degraded.js";
 
 // ─── Module-level state ──────────────────────────────────────────────────────
 // OpenClaw calls registerOffload() multiple times during lifecycle.
@@ -119,13 +122,22 @@ function simpleHash(str: string): number {
   return hash;
 }
 
-/** Compute a fingerprint for a message (role + first 200 chars of content). */
+/**
+ * Compute a fingerprint for a message (role + FULL content).
+ *
+ * The previous implementation hashed only the first 200 characters.
+ * Long tool results routinely share their opening 200 chars — a JSON
+ * envelope, a log preamble, a repeated header — so genuinely distinct
+ * messages produced identical fingerprints and change detection concluded
+ * nothing moved. Hash the full content instead; this shares the E1
+ * full-digest approach (sha256 over complete bytes, not a prefix).
+ */
 function _msgFingerprint(msg: any): number {
   const role = msg.role ?? msg.message?.role ?? msg.type ?? "";
   let content = "";
   const raw = msg.type === "message" ? msg.message?.content : msg.content;
-  if (typeof raw === "string") content = raw.slice(0, 200);
-  else if (Array.isArray(raw)) content = JSON.stringify(raw).slice(0, 200);
+  if (typeof raw === "string") content = raw;
+  else if (Array.isArray(raw)) content = JSON.stringify(raw);
   return simpleHash(`${role}:${content}`);
 }
 
@@ -298,6 +310,8 @@ export function registerOffload(api: any, offloadConfig: OffloadConfig): void {
     mildOffloadRatio: offloadConfig.mildOffloadRatio,
     aggressiveCompressRatio: offloadConfig.aggressiveCompressRatio,
     mmdMaxTokenRatio: offloadConfig.mmdMaxTokenRatio,
+    l1DegradedUnknownScore: offloadConfig.l1DegradedUnknownScore,
+    l1DegradedRetryPoolCap: offloadConfig.l1DegradedRetryPoolCap,
   };
 
   // Fix 4: Configure token tracker encoding to match plugin config (default: o200k_base)
@@ -406,15 +420,82 @@ export function registerOffload(api: any, offloadConfig: OffloadConfig): void {
   const L1_BATCH_SIZE = 5; // matches backend toolPairs limit (1-5)
   const L2_BATCH_SIZE = 30; // max entries per L2 backend call to avoid oversized requests / timeouts
 
+  // ─── Degraded retry queue (per session, persisted) ──────────────────────
+  const _degradedQueues = new WeakMap<OffloadStateManager, DegradedRetryQueue>();
+  const getDegradedRetryQueue = (stateManager: OffloadStateManager): DegradedRetryQueue => {
+    let q = _degradedQueues.get(stateManager);
+    if (!q) {
+      const cap = pCfg.l1DegradedRetryPoolCap ?? PLUGIN_DEFAULTS.l1DegradedRetryPoolCap;
+      q = new DegradedRetryQueue(stateManager.ctx, logger, cap);
+      _degradedQueues.set(stateManager, q);
+    }
+    return q;
+  };
+
+  /**
+   * Retry one due degraded item per flush (the L1 serial lock guarantees
+   * ordering). On success the entries are rewritten with real summaries and a
+   * real score, clearing the explicit unknown; on failure the item is
+   * re-enqueued with exponential backoff until attempts are exhausted, after
+   * which the entries are marked `l1RetriesExhausted` (last-resort cascade
+   * tier) rather than frozen or silently dropped.
+   */
+  const processDegradedRetries = async (stateManager: OffloadStateManager): Promise<void> => {
+    if (!backendClient) return;
+    const unknownScoreEnabled =
+      (pCfg.l1DegradedUnknownScore ?? PLUGIN_DEFAULTS.l1DegradedUnknownScore) === true;
+    if (!unknownScoreEnabled) return;
+    const queue = getDegradedRetryQueue(stateManager);
+    const item = await queue.dequeueDue();
+    if (!item) return;
+    try {
+      const req: L1Request = {
+        recentMessages: _buildL1RecentContext(stateManager),
+        toolPairs: item.pairs.map((p) => ({
+          toolName: p.toolName,
+          toolCallId: p.toolCallId,
+          params: typeof p.params === "string" ? sanitizeText(p.params) : p.params,
+          result: typeof p.result === "string" ? sanitizeText(p.result as string) : p.result,
+          timestamp: p.timestamp,
+        })),
+      };
+      const resp = await backendClient.l1Summarize(req);
+      if (!resp.entries || resp.entries.length === 0) {
+        throw new Error("L1 retry returned no entries");
+      }
+      const byId = new Map(resp.entries.map((e) => [e.tool_call_id, e]));
+      const allEntries = await readAllOffloadEntries(stateManager.ctx);
+      let changed = false;
+      for (const entry of allEntries) {
+        const fresh = byId.get(entry.tool_call_id);
+        if (fresh) {
+          entry.summary = fresh.summary;
+          entry.score = fresh.score ?? null;
+          if (fresh.result_ref) entry.result_ref = fresh.result_ref;
+          entry.l1RetriesExhausted = false;
+          changed = true;
+        }
+      }
+      if (changed) await rewriteAllOffloadEntries(stateManager.ctx, allEntries);
+      await queue.recordResult(item, true);
+      logger.debug?.(`[context-offload] degraded retry OK: re-summarized ${byId.size} entries`);
+    } catch (err) {
+      await queue.recordResult(item, false);
+      logger.warn?.(`[context-offload] degraded retry failed (${item.toolCallIds.length} entries, attempt ${item.attempts + 1}): ${err}`);
+    }
+  };
+
   // ─── Backend-aware L1 flush helper (with batching + retry + fallback) ──────
   // Backend mode only: take pairs → filter → split into batches → per-batch HTTP
   // → on failure: retry up to MAX_L1_CHUNK_RETRIES → then generate local fallback entries.
   const flushL1 = async (stateManager: OffloadStateManager, triggerSource: string, fireAndForget = false, maxCount?: number): Promise<void> => {
     if (!backendClient) return;
-    if (!stateManager.hasPending()) return;
 
     const release = await stateManager.acquireL1Lock();
     try {
+      // Before processing fresh pairs, retry any due degraded entries.
+      await processDegradedRetries(stateManager);
+      if (!stateManager.hasPending()) return;
       // Take and filter pairs
       const pendingCount = stateManager.getPendingCount();
       const takeCount = maxCount != null ? Math.min(maxCount, pendingCount) : pendingCount;
@@ -486,8 +567,7 @@ export function registerOffload(api: any, offloadConfig: OffloadConfig): void {
               }
             }
             await appendOffloadEntries(stateManager.ctx, resp.entries, undefined, logger);
-            stateManager.entryCounter += resp.entries.length;
-            logger.debug?.(`[context-offload] L1 batch OK: ${resp.entries.length} entries from ${chunk.length} pairs (entryCounter=${stateManager.entryCounter})`);
+            logger.debug?.(`[context-offload] L1 batch OK: ${resp.entries.length} entries from ${chunk.length} pairs`);
           }
         } catch (err) {
           const newFails = prevFails + 1;
@@ -497,6 +577,12 @@ export function registerOffload(api: any, offloadConfig: OffloadConfig): void {
             // Exceeded retry limit — generate local fallback entries (no LLM summary)
             logger.warn(`[context-offload] L1 batch DEGRADED: ${chunk.length} pairs → fallback entries (no LLM summary)`);
             stateManager._l1ChunkFailCounts.delete(chunkKey);
+            // Score means replaceability. A degraded entry's
+            // replaceability is UNKNOWN — write null (explicit unknown) rather
+            // than 0 ("never replace"), behind a config switch.
+            const unknownScoreEnabled =
+              (pCfg.l1DegradedUnknownScore ?? PLUGIN_DEFAULTS.l1DegradedUnknownScore) === true;
+            const degradedScore: number | null = unknownScoreEnabled ? null : 0;
             const fallbackEntries: import("./types.js").OffloadEntry[] = [];
             for (const p of chunk) {
               const resultStr = typeof p.result === "string" ? p.result : JSON.stringify(p.result ?? "");
@@ -511,11 +597,26 @@ export function registerOffload(api: any, offloadConfig: OffloadConfig): void {
                 summary: `[L1 degraded] ${p.toolName}: ${truncResult}`,
                 result_ref: refByToolCallId.get(p.toolCallId) ?? "",
                 tool_call_id: p.toolCallId,
-                score: 0,
+                score: degradedScore,
               });
             }
             await appendOffloadEntries(stateManager.ctx, fallbackEntries, undefined, logger);
-            stateManager.entryCounter += fallbackEntries.length;
+            // Gate metric + retry queue: degraded entries are retried
+            // rather than frozen into the store.
+            report("degraded_entry_rate", {
+              source: "l1_fallback_write",
+              count: fallbackEntries.length,
+              score: degradedScore === null ? "unknown" : "legacy-zero",
+              sessionId: stateManager.ctx.sessionId,
+            });
+            if (unknownScoreEnabled && fallbackEntries.length > 0) {
+              const queue = getDegradedRetryQueue(stateManager);
+              await queue.enqueue(
+                chunk.map((p) => p as unknown as import("./types.js").ToolPair),
+                fallbackEntries.map((e) => e.tool_call_id),
+              );
+              logger.debug?.(`[context-offload] enqueued ${fallbackEntries.length} degraded entries for L1 retry (pool=${queue.size})`);
+            }
             logger.debug?.(`[context-offload] L1 fallback: wrote ${fallbackEntries.length} degraded entries`);
           } else {
             // Under retry limit — re-enqueue this chunk for next flush
@@ -542,16 +643,16 @@ export function registerOffload(api: any, offloadConfig: OffloadConfig): void {
   const L15_RETRY_DELAY_MS = 3000;
 
   /** L1.5 fail-safe: push a short boundary instead of marking entries on disk. */
-  const _l15FailSafe = async (stateManager: OffloadStateManager, startIndex: number) => {
+  const _l15FailSafe = async (stateManager: OffloadStateManager, startSeq: number) => {
     stateManager.setActiveMmd(null, null);
-    stateManager.pushBoundary({ startIndex, result: "short", targetMmd: null });
+    await stateManager.pushBoundary({ startSeq, result: "short", targetMmd: null });
     await stateManager.save();
     stateManager.setMmdInjectionReady(false);
     stateManager.l15Settled = true;
-    logger.warn(`[context-offload] L1.5 fail-safe: settled (boundary short @${startIndex}, activeMmd=null)`);
+    logger.warn(`[context-offload] L1.5 fail-safe: settled (boundary short @seq=${startSeq}, activeMmd=null)`);
   };
 
-  const attemptL15 = async (stateManager: OffloadStateManager, startIndex: number): Promise<boolean> => {
+  const attemptL15 = async (stateManager: OffloadStateManager, startSeq: number): Promise<boolean> => {
     try {
       // Build request
       const allMmds = await listMmds(stateManager.ctx);
@@ -605,16 +706,17 @@ export function registerOffload(api: any, offloadConfig: OffloadConfig): void {
       const mmdSwitched = prevMmdFile && newMmdFile !== prevMmdFile;
       if (mmdSwitched) {
         // Fire-and-forget: flush residual null entries for the OLD mmd.
-        // Only include entries whose index < startIndex (they belong to the
-        // previous boundary, not the new one being pushed below).
-        const _flushStartIndex = startIndex;
+        // Only include entries whose durable seq is below the new boundary's
+        // startSeq — they belong to the previous segment, not the new one
+        // being pushed below. Seq (not list position) survives log rewrites.
+        const _flushStartSeq = startSeq;
         const _flushPrevMmd = prevMmdFile!;
         (async () => {
           try {
             const allEntries = await readAllOffloadEntries(stateManager.ctx);
             const residualEntries: typeof allEntries = [];
-            for (let idx = 0; idx < allEntries.length && idx < _flushStartIndex; idx++) {
-              const e = allEntries[idx];
+            for (const e of allEntries) {
+              if (typeof e.seq !== "number" || e.seq >= _flushStartSeq) break;
               if ((e.node_id === null || e.node_id === "wait") && !(e.tool_call ?? "").includes("HEARTBEAT.md")) {
                 residualEntries.push(e);
               }
@@ -626,7 +728,7 @@ export function registerOffload(api: any, offloadConfig: OffloadConfig): void {
             residualByMmd.set(_flushPrevMmd, residualEntries);
 
             logger.debug?.(
-              `[context-offload] L1.5 task-switch flush: ${residualEntries.length} residual null entries (idx<${_flushStartIndex}) for old mmd=${_flushPrevMmd}, triggering forced L2`,
+              `[context-offload] L1.5 task-switch flush: ${residualEntries.length} residual null entries (seq<${_flushStartSeq}) for old mmd=${_flushPrevMmd}, triggering forced L2`,
             );
             await runL2WithBackend(stateManager, residualByMmd, "task_switch_flush");
           } catch (flushErr) {
@@ -638,11 +740,11 @@ export function registerOffload(api: any, offloadConfig: OffloadConfig): void {
       // Push boundary based on L1.5 result
       const activeMmdFile = stateManager.getActiveMmdFile();
       if (activeMmdFile) {
-        stateManager.pushBoundary({ startIndex, result: "long", targetMmd: activeMmdFile });
-        logger.debug?.(`[context-offload] L1.5 boundary: long @${startIndex} → ${activeMmdFile}`);
+        await stateManager.pushBoundary({ startSeq, result: "long", targetMmd: activeMmdFile });
+        logger.debug?.(`[context-offload] L1.5 boundary: long @seq=${startSeq} → ${activeMmdFile}`);
       } else {
-        stateManager.pushBoundary({ startIndex, result: "short", targetMmd: null });
-        logger.debug?.(`[context-offload] L1.5 boundary: short @${startIndex}`);
+        await stateManager.pushBoundary({ startSeq, result: "short", targetMmd: null });
+        logger.debug?.(`[context-offload] L1.5 boundary: short @seq=${startSeq}`);
       }
 
       await stateManager.save();
@@ -670,22 +772,27 @@ export function registerOffload(api: any, offloadConfig: OffloadConfig): void {
       }
     }
 
-    // Record the dividing line: entries after this index belong to this turn
-    const startIndex = stateManager.entryCounter;
-    logger.debug?.(`[context-offload] L1.5 boundary startIndex=${startIndex} (pending flushed=${snapshotCount})`);
+    // Record the dividing line as the next seq that will be assigned: the
+    // pre-flush above has already written (and seq-numbered) every entry that
+    // belongs to the previous segment, so entries from this seq onward belong
+    // to the segment being judged now. peekNextSeq reads the storage layer's
+    // authoritative seq cache, so the value is correct even right after a
+    // session switch or a log rewrite.
+    const startSeq = await peekNextSeq(stateManager.ctx);
+    logger.debug?.(`[context-offload] L1.5 boundary startSeq=${startSeq} (pending flushed=${snapshotCount})`);
 
     // First attempt
-    if (await attemptL15(stateManager, startIndex)) return;
+    if (await attemptL15(stateManager, startSeq)) return;
 
     // Single retry after delay (fire-and-forget)
     const retry = async () => {
       await new Promise((r) => setTimeout(r, L15_RETRY_DELAY_MS));
       if (_l15Disposed || stateManager.l15Settled) return;
       logger.debug?.("[context-offload] L1.5 retrying... (1/1)");
-      if (await attemptL15(stateManager, startIndex)) return;
+      if (await attemptL15(stateManager, startSeq)) return;
       // Both attempts failed — activate fail-safe
       logger.warn("[context-offload] L1.5 FAILED after 1 retry, activating fail-safe");
-      await _l15FailSafe(stateManager, startIndex);
+      await _l15FailSafe(stateManager, startSeq);
     };
     retry().catch(() => {});
   };
@@ -740,6 +847,15 @@ export function registerOffload(api: any, offloadConfig: OffloadConfig): void {
           if (changed) await rewriteAllOffloadEntries(stateManager.ctx, allEntries);
           if (bIdx === 0) {
             stateManager.setLastL2TriggerTime(nowChinaISO());
+            // Advance the seq cursor to the highest seq this pass covers, so
+            // the time-based trigger can tell genuinely new offload rows (seq
+            // greater than this) from ones L2 has already seen.
+            let maxSeq = -1;
+            for (const e of mmdEntries) {
+              const s = (e as { seq?: unknown }).seq;
+              if (typeof s === "number" && s > maxSeq) maxSeq = s;
+            }
+            stateManager.setLastProcessedSeq(maxSeq >= 0 ? maxSeq : null);
             await stateManager.save();
           }
 
@@ -749,10 +865,7 @@ export function registerOffload(api: any, offloadConfig: OffloadConfig): void {
             // Handle backend degraded response (empty fileAction = LLM unavailable)
             if (!resp.fileAction) {
               logger.warn(`[context-offload] L2 [${mmdFile}] batch ${bIdx + 1}/${batches.length}: degraded response, applying fallback backfill`);
-              await backfillNodeIds(stateManager.ctx, resp.nodeMapping ?? {}, batchWaitIds, logger, {
-                mmdFallbackText: existingMmd ?? "",
-                mmdPrefix,
-              });
+              await backfillNodeIds(stateManager.ctx, resp.nodeMapping ?? {}, batchWaitIds, logger);
               continue;
             }
 
@@ -769,18 +882,10 @@ export function registerOffload(api: any, offloadConfig: OffloadConfig): void {
               logger.debug?.(`[context-offload] L2 [${mmdFile}] batch ${bIdx + 1}/${batches.length}: writeMmd: ${resp.mmdContent.length} chars`);
             }
 
-            // Backfill node_ids
-            const mmdAfterWrite = await readMmd(stateManager.ctx, mmdFile);
-            const mmdForBackfill =
-              typeof mmdAfterWrite === "string" && mmdAfterWrite.trim().length > 0
-                ? mmdAfterWrite
-                : typeof existingMmd === "string" && existingMmd.trim().length > 0
-                  ? existingMmd
-                  : "";
-            await backfillNodeIds(stateManager.ctx, resp.nodeMapping ?? {}, batchWaitIds, logger, {
-              mmdFallbackText: mmdForBackfill,
-              mmdPrefix,
-            });
+            // Backfill node_ids — only the model's node_mapping is applied;
+            // calls the model omitted stay honestly unmapped (node_id=null) and
+            // their count is surfaced as the `unmapped` metric, never guessed.
+            await backfillNodeIds(stateManager.ctx, resp.nodeMapping ?? {}, batchWaitIds, logger);
 
             logger.debug?.(`[context-offload] L2 [${mmdFile}] batch ${bIdx + 1}/${batches.length} (${triggerSource}): applied, action=${resp.fileAction}, mapping=${Object.keys(resp.nodeMapping ?? {}).length}`);
           } catch (err) {
@@ -2306,5 +2411,6 @@ export const _testExports = {
   _buildL15RecentContext,
   isInternalMemorySession,
   simpleHash,
+  _msgFingerprint,
   OffloadContextEngine,
 };

@@ -25,8 +25,31 @@ export interface OffloadEntry {
   tool_call_id: string;
   /** Session key this entry belongs to */
   session_key?: string;
-  /** Replaceability score (0-10). Higher = summary can better replace original. Assigned by L1 LLM. */
-  score?: number;
+  /**
+   * Monotonic per-entry sequence number, assigned at append time and never
+   * reused or renumbered. This is the durable identity that L1.5 boundaries
+   * reference — a positional index into the log is not stable across rewrites.
+   * May be absent on legacy entries written before seq existed; the read path
+   * backfills and persists it on first access.
+   */
+  seq?: number;
+  /**
+   * Replaceability score (0-10). Higher = summary can better replace original.
+   * Assigned by L1 LLM.
+   *
+   * `null` is an explicit UNKNOWN — the L1 extraction failed and the
+   * entry was written degraded, so replaceability is genuinely unknown rather
+   * than "definitely keep" (which `0` wrongly implied). Consumers must give
+   * `null` its own ordering position: after every scored entry, ahead of
+   * unknowns with exhausted retries. A missing score (`undefined`, legacy
+   * entries) is treated as the neutral default 5.
+   */
+  score?: number | null;
+  /**
+   * True once this degraded entry's L1 retry queue attempts are
+   * exhausted. Exhausted unknowns are the last resort in the mild cascade.
+   */
+  l1RetriesExhausted?: boolean;
 }
 
 /** A buffered tool call + result pair waiting to be processed by L1 */
@@ -54,6 +77,13 @@ export interface PluginState {
   lastOffloadedToolCallId: string | null;
   /** ISO timestamp of the last successful L2 trigger */
   lastL2TriggerTime: string | null;
+  /**
+   * Highest entry seq covered by the most recent L2 pass. The time-based L2
+   * trigger uses this to decide whether genuinely new offload rows exist:
+   * only entries with `seq > lastProcessedSeq` count as new. `null` means L2
+   * has never processed anything, so any null entry is new.
+   */
+  lastProcessedSeq: number | null;
 }
 
 /** Metadata block embedded in MMD files */
@@ -98,12 +128,17 @@ export interface TaskJudgment {
 }
 
 /** L1.5 boundary marker: divides entries into task-attributed segments.
- *  Each boundary defines the ownership of entries from startIndex onward
- *  until the next boundary's startIndex. */
+ *  Each boundary defines the ownership of entries from startSeq onward
+ *  until the next boundary's startSeq.
+ *
+ *  Boundaries reference the monotonic per-entry `seq` (never reused,
+ *  assigned on append) rather than a positional array index, and are
+ *  persisted to an append-only `boundaries-<session>.jsonl` log so they
+ *  survive session switches and entry-log rewrites. */
 export interface L15Boundary {
-  /** Entry counter value when L1.5 judgment started.
-   *  Entries at this index and beyond belong to this boundary's result. */
-  startIndex: number;
+  /** Entry seq value when L1.5 judgment started.
+   *  Entries with this seq and beyond belong to this boundary's result. */
+  startSeq: number;
   /** L1.5 judgment result for this segment */
   result: "long" | "short" | "pending";
   /** If result="long", the target MMD file for L2 to construct into */
@@ -207,6 +242,20 @@ export interface PluginConfig {
    * Default: 0.12 (12%).
    */
   defaultSystemOverheadRatio?: number;
+  /**
+   * When true (default), L1-degraded fallback entries are written with
+   * `score: null` (explicit unknown) instead of legacy `score: 0`, and get
+   * their own explicit position in the mild-cascade ordering (after scored
+   * entries, ahead of exhausted-retry unknowns). Set false for legacy
+   * behavior. Default: true.
+   */
+  l1DegradedUnknownScore?: boolean;
+  /**
+   * Absolute cap on the degraded-entry retry pool per session; past
+   * the cap the oldest unknown is evicted (marked exhausted) first.
+   * Default: 10.
+   */
+  l1DegradedRetryPoolCap?: number;
 }
 
 // ============================
@@ -246,4 +295,8 @@ export const PLUGIN_DEFAULTS = {
   l3TokenCountMode: "tiktoken" as const,
   l3TiktokenEncoding: "cl100k_base" as const,
   defaultSystemOverheadRatio: 0.12,
+  /** Degraded entries use score:null (explicit unknown) instead of 0 */
+  l1DegradedUnknownScore: true,
+  /** Cap on the degraded-entry retry pool per session */
+  l1DegradedRetryPoolCap: 10,
 } as const;

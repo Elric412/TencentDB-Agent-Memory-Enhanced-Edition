@@ -1,7 +1,7 @@
 /**
- * F2 — mild-cascade "revert" regression tests.
+ * Mild-cascade "revert" regression tests.
  *
- * Plan.md F2 (llm-input-l3.ts over-length branch): previously, when a
+ * Plan.md (llm-input-l3.ts over-length branch): previously, when a
  * generated summary turned out LONGER than the original tool output,
  * replaceWithSummary (l3-helpers.ts) had already destroyed the message
  * content in place, so the "revert" branch only flipped `_offloaded` and
@@ -49,7 +49,7 @@ function makeMap(entries: OffloadEntry[]): Map<string, OffloadEntry> {
   return m;
 }
 
-describe("F2 — mild cascade revert actually reverts", () => {
+describe("mild cascade revert actually reverts", () => {
   it("detection: over-length summary triggers revert and restores the original content exactly", () => {
     const originalContent = "short output"; // 12 chars
     const messages = [

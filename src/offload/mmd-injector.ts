@@ -9,6 +9,7 @@
  * The marker property `_mmdContextMessage` is used to locate the message for
  * replacement. L3 compression must skip messages carrying this marker.
  */
+import { createHash } from "node:crypto";
 import { readMmd, listMmds } from "./storage.js";
 import { PLUGIN_DEFAULTS, type PluginConfig, type PluginLogger } from "./types.js";
 import { createL3TokenCounter } from "./l3-token-counter.js";
@@ -369,6 +370,14 @@ async function buildActiveMmdBlock(
   }
 }
 
-function computeFingerprint(content: string): string {
-  return `${content.length}:${content.slice(0, 64)}`;
+/**
+ * Fingerprint the FULL canvas content. The previous scheme
+ * (`${length}:${slice(0,64)}`) collided on any edit that preserved length and
+ * the shared mermaid header — i.e. most real edits — causing the injector to
+ * keep serving stale task state. Hash the entire body instead (the digest
+ * machinery). The value is only ever compared for equality and stored as an
+ * opaque string, so the format change is safe.
+ */
+export function computeFingerprint(content: string): string {
+  return `sha256:${createHash("sha256").update(content, "utf-8").digest("hex")}`;
 }

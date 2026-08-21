@@ -35,6 +35,12 @@ export type MemoryType = "persona" | "episodic" | "instruction";
 export interface EpisodicMetadata {
   activity_start_time?: string; // ISO 8601
   activity_end_time?: string; // ISO 8601
+  /**
+   * When a batch's dedup judgment failed and its records were stored
+   * anyway (fail-open), the quarantined records carry `dedup: "unverified"`
+   * so recall can deliberately down-weight them.
+   */
+  dedup?: "verified" | "unverified";
 }
 
 /**

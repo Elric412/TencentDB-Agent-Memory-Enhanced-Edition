@@ -189,6 +189,12 @@ export interface CompletedTurn {
    * polluted by prependContext injection.
    */
   originalUserMessageCount?: number;
+  /**
+   * Explicit turn outcome — "error" for failed turns, "success"
+   * otherwise. A failed turn is high-value memory and must be captured,
+   * not filtered out before extraction ever sees it.
+   */
+  outcome?: "success" | "error";
 }
 
 // ============================

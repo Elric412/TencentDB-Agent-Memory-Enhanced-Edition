@@ -16,6 +16,8 @@ import {
   extractDeletedIdsFromEntries,
   registerSession,
   listMmds,
+  appendBoundary,
+  readBoundaries,
 } from "./storage.js";
 import type { StorageContext } from "./storage.js";
 import type { ToolPair, PluginState, OffloadEntry, L15Boundary } from "./types.js";
@@ -27,6 +29,7 @@ const DEFAULT_STATE: PluginState & { estimatedSystemOverhead: number | null } = 
   lastSessionKey: null,
   lastOffloadedToolCallId: null,
   lastL2TriggerTime: null,
+  lastProcessedSeq: null,
   estimatedSystemOverhead: null,
 };
 
@@ -111,9 +114,7 @@ export class OffloadStateManager {
   l15ConsecutiveNullCount = 0;
 
   // ─── L1.5 Boundary (runtime-only, per-session) ────────────────────────
-  /** Global entry counter, incremented after each appendOffloadEntries. */
-  entryCounter = 0;
-  /** Settled boundaries (ascending by startIndex). */
+  /** Settled boundaries (ascending by startSeq). */
   l15Boundaries: L15Boundary[] = [];
 
   // ─── StorageContext accessor ─────────────────────────────────────────────
@@ -280,9 +281,11 @@ export class OffloadStateManager {
       this.lastMmdInjectedTokens = 0;
       this.cachedUserPrompt = null;
       this.lastL15PromptHash = null;
-      // Restore entryCounter from persisted entries; reset boundaries
-      this.entryCounter = entries.length;
-      this.l15Boundaries = [];
+      // Reload boundaries from the append-only log instead of wiping them.
+      // The next-seq value is not tracked here: the storage layer's seq cache
+      // (peekNextSeq) is the single source of truth, seeded from the durable
+      // max seq of the on-disk log.
+      this.l15Boundaries = await readBoundaries(this._ctx);
       // Reset P1 quick-skip state
       this.lastKnownTotalTokens = 0;
       this.lastKnownMessageCount = 0;
@@ -339,6 +342,24 @@ export class OffloadStateManager {
 
   setLastL2TriggerTime(time: string | null): void {
     this.state.lastL2TriggerTime = time;
+  }
+
+  /** Highest entry seq covered by the most recent L2 pass (null = none yet). */
+  getLastProcessedSeq(): number | null {
+    return this.state.lastProcessedSeq;
+  }
+
+  /**
+   * Record the highest seq an L2 pass has covered. Monotonic: a lower value
+   * never overwrites a higher one, so an out-of-order or partial pass cannot
+   * move the cursor backwards and make already-processed rows look new again.
+   */
+  setLastProcessedSeq(seq: number | null): void {
+    if (typeof seq !== "number") return;
+    const prev = this.state.lastProcessedSeq;
+    if (prev === null || seq > prev) {
+      this.state.lastProcessedSeq = seq;
+    }
   }
 
   // ─── Full State Access ───────────────────────────────────────────────────
@@ -424,37 +445,62 @@ export class OffloadStateManager {
     return params ?? null;
   }
 
-  // ─── L1.5 Boundary Helpers ─────────────────────────────────────────────
+  // ─── L1.5 Boundary Helpers (seq-keyed, append-only, persisted) ───────────
 
   /**
-   * Append a new boundary (must be in ascending startIndex order).
-   * If the last boundary has the same startIndex, overwrite it instead of
-   * appending — this happens during fast task switching when no tool calls
-   * (and thus no L1 entries) are produced between consecutive L1.5 judgments.
+   * Reload boundaries from the append-only boundaries.jsonl log.
+   * Called on init/switchSession so boundaries survive session changes.
    */
-  pushBoundary(boundary: L15Boundary): void {
-    const last = this.l15Boundaries.at(-1);
-    if (last && last.startIndex === boundary.startIndex) {
-      this.l15Boundaries[this.l15Boundaries.length - 1] = boundary;
-    } else {
-      this.l15Boundaries.push(boundary);
+  async loadBoundaries(): Promise<L15Boundary[]> {
+    this.l15Boundaries = await readBoundaries(this.ctx);
+    return this.l15Boundaries;
+  }
+
+  /**
+   * Append a new boundary. Boundaries are keyed by the monotonic entry
+   * `seq`, never by positional index, and are persisted to an append-only
+   * boundaries.jsonl. History is preserved: a new boundary with the same
+   * startSeq as an existing one is appended alongside it (resolution takes
+   * the latest), not silently overwritten.
+   */
+  async pushBoundary(boundary: L15Boundary): Promise<void> {
+    this.l15Boundaries.push(boundary);
+    this.l15Boundaries.sort((a, b) => a.startSeq - b.startSeq);
+    try {
+      await appendBoundary(this.ctx, boundary);
+    } catch (err) {
+      // Persistence failure must not crash the pipeline; the in-memory list
+      // still holds the boundary for this session.
+      console.warn?.(`[context-offload] pushBoundary: failed to persist boundary (startSeq=${boundary.startSeq}): ${err}`);
     }
   }
 
   /**
-   * Find the boundary that covers the given entry index.
-   * Returns the last boundary whose startIndex <= entryIndex,
-   * or null if no boundary covers it (entry predates all boundaries).
+   * Find the boundary that covers the given entry seq.
+   * Returns the boundary with the greatest startSeq <= seq (the latest one
+   * wins when several share a startSeq), or null if none covers it.
    */
-  resolveEntryBoundary(entryIndex: number): L15Boundary | null {
+  resolveBoundaryForSeq(seq: number): L15Boundary | null {
     let matched: L15Boundary | null = null;
     for (const b of this.l15Boundaries) {
-      if (b.startIndex <= entryIndex) {
-        matched = b;
+      if (b.startSeq <= seq) {
+        matched = b; // ascending; keep scanning so the latest same-startSeq wins
       } else {
-        break; // boundaries are ascending by startIndex
+        break;
       }
     }
     return matched;
+  }
+
+  /**
+   * Resolve an entry by its durable seq within a given entry list.
+   * Independent of the entry's position in the list, so it stays correct
+   * across entry-log rewrites/reordering.
+   */
+  resolveEntryBySeq(entries: Array<OffloadEntry & { seq?: number }>, seq: number): (OffloadEntry & { seq?: number }) | null {
+    for (const e of entries) {
+      if (typeof e.seq === "number" && e.seq === seq) return e;
+    }
+    return null;
   }
 }

@@ -29,6 +29,7 @@ import {
 import type { OffloadStateManager } from "../state-manager.js";
 import type { BackendClient } from "../backend-client.js";
 import { buildL3TriggerReport, reportL3Trigger } from "../state-reporter.js";
+import { report } from "../../core/report/reporter.js";
 
 // ─── Heartbeat message filtering ─────────────────────────────────────────────
 
@@ -114,8 +115,31 @@ export function isTokenOverflowError(err: any): boolean {
 export const MILD_CASCADE_MIN_COUNT = 10;
 export const MILD_CASCADE_INITIAL_SCORE = 7;
 export const MILD_CASCADE_FLOOR_SCORE = 1;
+/**
+ * Explicit ordering tiers for unknown scores (`score: null`).
+ * Unknown entries sit BELOW every scored entry (tier 0 < floor 1) and ABOVE
+ * unknowns whose L1 retries are exhausted (tier -1). A missing score
+ * (`undefined`, legacy entries) keeps the neutral default of 5.
+ */
+export const MILD_CASCADE_UNKNOWN_SCORE = 0;
+export const MILD_CASCADE_EXHAUSTED_UNKNOWN_SCORE = -1;
 export const AGGRESSIVE_MIN_MESSAGES_TO_KEEP = 2;
 export const EMERGENCY_MIN_MESSAGES_TO_KEEP = 2;
+
+/**
+ * Resolve an entry's cascade score with an explicit position for
+ * unknowns. `null` (degraded, replaceability unknown) is neither maximally
+ * precious nor maximally disposable — it is touchable once scored candidates
+ * are exhausted, but never ahead of them.
+ */
+function cascadeScoreOf(entry: OffloadEntry): number {
+  if (entry.score === null) {
+    return entry.l1RetriesExhausted
+      ? MILD_CASCADE_EXHAUSTED_UNKNOWN_SCORE
+      : MILD_CASCADE_UNKNOWN_SCORE;
+  }
+  return entry.score ?? 5;
+}
 
 // Maximum content length (chars) to keep when truncating an oversized message in-place.
 // ~2K chars ≈ ~500 tokens — enough to preserve tool_call_id and a snippet of context.
@@ -426,7 +450,10 @@ export function compressByScoreCascade(
             const entry = getOffloadEntry(offloadMap, tuId);
             if (!entry) { allHaveEntry = false; break; }
             tuEntries.push(entry);
-            const s = entry.score ?? 5;
+            // Null score (unknown) gets its own tier below all scored
+            // entries; a group containing an unknown is only as disposable as
+            // its least-disposable member.
+            const s = cascadeScoreOf(entry);
             if (s < minScore) minScore = s;
           }
           if (allHaveEntry && tuEntries.length > 0) {
@@ -444,7 +471,7 @@ export function compressByScoreCascade(
     if (!toolCallId) continue;
     const offloadEntry = getOffloadEntry(offloadMap, toolCallId);
     if (!offloadEntry) continue;
-    candidates.push({ msgIndex: i, toolCallId, offloadEntry, score: offloadEntry.score ?? 5 });
+    candidates.push({ msgIndex: i, toolCallId, offloadEntry, score: cascadeScoreOf(offloadEntry) });
   }
   if (candidates.length === 0) {
     logger.debug?.(`[context-offload] L3-MILD: 0 candidates in scan range (0..${scanEnd}/${totalMessages}), offloadMap=${offloadMap.size} entries`);
@@ -460,6 +487,20 @@ export function compressByScoreCascade(
   }
   const scoreDistStr = [...scoreDist.entries()].sort((a, b) => b[0] - a[0]).map(([s, n]) => `score=${s}:${n}`).join(", ");
   logger.debug?.(`[context-offload] L3-MILD: ${candidates.length} candidates (scan 0..${scanEnd}/${totalMessages}), distribution=[${scoreDistStr}], offloadMap=${offloadMap.size}`);
+
+  // Gate metric: unknown-score (degraded) entries flowing through the
+  // cascade are now visible. Previously score:0 was indistinguishable from
+  // "precious" and this counter could not leave zero.
+  const unknownCount = candidates.filter((c: any) => c.offloadEntry.score === null && !c.offloadEntry.l1RetriesExhausted).length;
+  const exhaustedUnknownCount = candidates.filter((c: any) => c.offloadEntry.score === null && c.offloadEntry.l1RetriesExhausted).length;
+  if (unknownCount > 0 || exhaustedUnknownCount > 0) {
+    report("degraded_entry_rate", {
+      source: "l3_mild_cascade",
+      unknown: unknownCount,
+      exhaustedUnknown: exhaustedUnknownCount,
+      totalCandidates: candidates.length,
+    });
+  }
 
   const toolCallIdToResultIdx = new Map<string, number>();
   const toolCallIdToAssistantIdx = new Map<string, number>();
@@ -491,7 +532,9 @@ export function compressByScoreCascade(
   const replacedDetails: Array<{ toolCallId: string; score: number; summaryPreview: string; originalLength?: number; summaryLength?: number }> = [];
   let activeThreshold = initialScore;
 
-  for (let threshold = initialScore; threshold >= MILD_CASCADE_FLOOR_SCORE; threshold--) {
+  // Descend past the scored floor (1) into the unknown tier (0) and,
+  // only when even those are gone, the exhausted-unknown tier (-1).
+  for (let threshold = initialScore; threshold >= MILD_CASCADE_EXHAUSTED_UNKNOWN_SCORE; threshold--) {
     activeThreshold = threshold;
     for (const c of candidates) {
       if (c.score < threshold) continue;

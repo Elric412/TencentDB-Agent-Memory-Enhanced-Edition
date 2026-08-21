@@ -12,9 +12,11 @@
  * 4. Write to L1 JSONL files
  */
 
+import fs from "node:fs/promises";
+import path from "node:path";
 import type { ConversationMessage } from "../conversation/l0-recorder.js";
 import { EXTRACT_MEMORIES_SYSTEM_PROMPT, formatExtractionPrompt } from "../prompts/l1-extraction.js";
-import { batchDedup } from "./l1-dedup.js";
+import { batchDedup, DedupFailureError } from "./l1-dedup.js";
 import { writeMemory, generateMemoryId } from "./l1-writer.js";
 import type { ExtractedMemory, MemoryRecord, MemoryType, DedupDecision } from "./l1-writer.js";
 import { CleanContextRunner } from "../../utils/clean-context-runner.js";
@@ -25,6 +27,78 @@ import { report } from "../report/reporter.js";
 import type { LLMRunner, Logger } from "../types.js";
 
 const TAG = "[memory-tdai][l1-extractor]";
+
+// ============================
+// Pending-dedup quarantine
+// ============================
+// When a batch's dedup judgment fails, the batch is quarantined here
+// (one JSONL file per session, under <baseDir>/pending-dedup/) and retried
+// on a later run instead of being committed to the live corpus as verified.
+// Records already stored fail-open carry metadata.dedup="unverified".
+
+function pendingDedupDir(baseDir: string): string {
+  return path.join(baseDir, "pending-dedup");
+}
+
+function pendingDedupFile(baseDir: string, sessionKey: string): string {
+  // Keep the filename filesystem-safe regardless of sessionKey contents.
+  const safe = sessionKey.replace(/[^A-Za-z0-9._-]/g, "_");
+  return path.join(pendingDedupDir(baseDir), `${safe}.jsonl`);
+}
+
+/** Append a quarantined batch (one record per line) to the session's pending file. */
+export async function appendPendingDedup(
+  baseDir: string,
+  sessionKey: string,
+  memories: Array<ExtractedMemory & { record_id: string }>,
+): Promise<void> {
+  await fs.mkdir(pendingDedupDir(baseDir), { recursive: true });
+  const file = pendingDedupFile(baseDir, sessionKey);
+  const lines = memories
+    .map((m) => JSON.stringify({ ...m, metadata: { ...m.metadata, dedup: "unverified" }, dedup: "unverified", quarantinedAt: new Date().toISOString() }))
+    .join("\n");
+  await fs.appendFile(file, lines + "\n", "utf-8");
+}
+
+/** Read all quarantined memories for a session (empty if none). */
+export async function readPendingDedup(
+  baseDir: string,
+  sessionKey: string,
+): Promise<Array<Record<string, unknown>>> {
+  const file = pendingDedupFile(baseDir, sessionKey);
+  let text: string;
+  try {
+    text = await fs.readFile(file, "utf-8");
+  } catch {
+    return [];
+  }
+  return text
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0)
+    .map((l) => {
+      try {
+        return JSON.parse(l) as Record<string, unknown>;
+      } catch {
+        return null;
+      }
+    })
+    .filter((x): x is Record<string, unknown> => x !== null);
+}
+
+/** Count quarantined memories for a session. */
+export async function countPendingDedup(baseDir: string, sessionKey: string): Promise<number> {
+  return (await readPendingDedup(baseDir, sessionKey)).length;
+}
+
+/** Remove the quarantine for a session (after a successful retry or manual clear). */
+export async function clearPendingDedup(baseDir: string, sessionKey: string): Promise<void> {
+  try {
+    await fs.rm(pendingDedupFile(baseDir, sessionKey), { force: true });
+  } catch {
+    /* ignore */
+  }
+}
 
 // ============================
 // Types
@@ -41,6 +115,30 @@ interface SceneSegment {
     source_message_ids: string[];
     metadata: Record<string, unknown>;
   }>;
+}
+
+/**
+ * Thrown when the LLM's extraction output cannot be parsed into the
+ * expected SceneSegment[] shape. This is deliberately a distinguishable
+ * failure: before this change, a parse failure was returned as `[]`, which
+ * is exactly what a legitimately uneventful conversation produces, so
+ * downstream code and metrics could not tell "nothing worth remembering"
+ * apart from "the extractor broke."
+ */
+export class ExtractionParseError extends Error {
+  /** Machine-readable failure reason. */
+  readonly reason: "no_json_array" | "not_an_array" | "invalid_json";
+  /** Truncated preview of the raw model output (for diagnostics). */
+  readonly rawPreview: string;
+
+  constructor(reason: ExtractionParseError["reason"], raw: string, cause?: unknown) {
+    const preview = raw.length > 2048 ? `${raw.slice(0, 2048)}…(+${raw.length - 2048})` : raw;
+    super(`L1 extraction parse failure (${reason}): rawLen=${raw.length}, rawPreview=${JSON.stringify(preview)}`);
+    this.name = "ExtractionParseError";
+    this.reason = reason;
+    this.rawPreview = preview;
+    if (cause !== undefined) this.cause = cause;
+  }
 }
 
 export interface L1ExtractionResult {
@@ -162,6 +260,18 @@ export async function extractL1Memories(params: {
     });
     logger?.debug?.(`${TAG} LLM detected ${scenes.length} scene(s)`);
   } catch (err) {
+    if (err instanceof ExtractionParseError) {
+      // A parse failure is NOT "nothing worth remembering." Count it
+      // separately (l1_parse_failure_rate) and propagate the typed error so
+      // the turn is visibly broken — never a clean zero-extraction success.
+      logger?.error(`${TAG} LLM extraction parse failed: ${err.message}`);
+      report("l1_parse_failure_rate", {
+        sessionKey,
+        reason: err.reason,
+        inputMessageCount: messages.length,
+      });
+      throw err;
+    }
     logger?.error(`${TAG} LLM extraction failed: ${err instanceof Error ? err.message : String(err)}`);
     return { success: false, extractedCount: 0, storedCount: 0, records: [], sceneNames: [] };
   }
@@ -202,11 +312,40 @@ export async function extractL1Memories(params: {
     };
   }
 
-  // Limit per session
+  // Limit per session — priority-band aware, NOT naive emission order.
+  // The extraction prompt defines explicit priority bands per type (and for
+  // instructions, priority -1 is a *strict global rule* — the MOST precious,
+  // not the least). Slicing the raw emitted order would drop a top-priority
+  // memory that happened to be emitted last in favour of a low-priority one
+  // emitted first. So: sort by priority band (desc), then by type, then
+  // truncate — and log what was dropped so the loss is visible.
   let extracted = allExtracted;
   if (extracted.length > maxMemoriesPerSession) {
-    logger?.debug?.(`${TAG} Limiting from ${extracted.length} to ${maxMemoriesPerSession} memories per session`);
-    extracted = extracted.slice(0, maxMemoriesPerSession);
+    const sorted = [...allExtracted]
+      .map((m, i) => ({ m, i }))
+      .sort((a, b) => {
+        const bandDiff = priorityBandRank(b.m) - priorityBandRank(a.m);
+        if (bandDiff !== 0) return bandDiff;
+        const typeDiff = typeRank(a.m.type) - typeRank(b.m.type);
+        if (typeDiff !== 0) return typeDiff;
+        return a.i - b.i; // stable: preserve emission order within a band+type
+      })
+      .map((x) => x.m);
+
+    const kept = sorted.slice(0, maxMemoriesPerSession);
+    const dropped = sorted.slice(maxMemoriesPerSession);
+    logger?.warn?.(
+      `${TAG} Truncated extraction from ${allExtracted.length} to ${maxMemoriesPerSession} memories (priority-aware); ` +
+      `dropped ${dropped.length}: [${dropped.map((d) => `"${d.content.slice(0, 60)}"(type=${d.type},priority=${d.priority})`).join(", ")}]`,
+    );
+    report("l1_extraction_truncated", {
+      sessionKey,
+      extracted: allExtracted.length,
+      kept: kept.length,
+      dropped: dropped.length,
+      droppedItems: dropped.map((d) => ({ content: d.content.slice(0, 120), type: d.type, priority: d.priority })),
+    });
+    extracted = kept;
   }
 
   // Assign temporary IDs to extracted memories (needed for batch dedup)
@@ -243,8 +382,33 @@ export async function extractL1Memories(params: {
         embeddingService: options.embeddingService,
       });
     } catch (err) {
-      logger?.warn?.(`${TAG} Batch dedup failed, storing all as new: ${err instanceof Error ? err.message : String(err)}`);
-      storedRecords = await storeAllDirectly(memoriesWithIds, baseDir, sessionKey, sessionId, logger, options.vectorStore, options.embeddingService);
+      if (err instanceof DedupFailureError) {
+        // Quarantine the batch to the pending area and retry it later,
+        // instead of committing unverified duplicates to the live corpus.
+        // The fail-open guarantee is preserved — every record is still
+        // persisted — but each carries metadata.dedup="unverified" so recall
+        // can deliberately down-weight it and metrics can observe the loss.
+        logger?.warn?.(`${TAG} Batch dedup failed, quarantining ${memoriesWithIds.length} memories to pending-dedup: ${err.message}`);
+        storedRecords = await storeAllDirectly(
+          memoriesWithIds.map((m) => ({ ...m, metadata: { ...m.metadata, dedup: "unverified" as const } })),
+          baseDir,
+          sessionKey,
+          sessionId,
+          logger,
+          options.vectorStore,
+          options.embeddingService,
+        );
+        await appendPendingDedup(baseDir, sessionKey, memoriesWithIds);
+        report("l1_dedup_failure", {
+          sessionKey,
+          reason: err.reason,
+          batchSize: memoriesWithIds.length,
+          quarantined: memoriesWithIds.length,
+        });
+      } else {
+        logger?.warn?.(`${TAG} Batch dedup failed, storing all as new: ${err instanceof Error ? err.message : String(err)}`);
+        storedRecords = await storeAllDirectly(memoriesWithIds, baseDir, sessionKey, sessionId, logger, options.vectorStore, options.embeddingService);
+      }
     }
   } else {
     storedRecords = await storeAllDirectly(memoriesWithIds, baseDir, sessionKey, sessionId, logger, options.vectorStore, options.embeddingService);
@@ -367,7 +531,7 @@ function parseExtractionResult(raw: string, logger?: Logger): SceneSegment[] {
       logger?.warn?.(
         `${TAG} [l1-debug] NO_JSON taskId=l1-extraction, rawLen=${raw.length}, cleanedLen=${cleaned.length}, rawFull=${JSON.stringify(rawPreview)}${raw.length > 2048 ? `…(+${raw.length - 2048})` : ""}`,
       );
-      return [];
+      throw new ExtractionParseError("no_json_array", raw);
     }
 
     // Sanitize control characters inside JSON string literals that LLM may produce
@@ -376,7 +540,7 @@ function parseExtractionResult(raw: string, logger?: Logger): SceneSegment[] {
 
     if (!Array.isArray(parsed)) {
       logger?.warn?.(`${TAG} Extraction response is not an array`);
-      return [];
+      throw new ExtractionParseError("not_an_array", raw);
     }
 
     const scenes: SceneSegment[] = [];
@@ -403,8 +567,14 @@ function parseExtractionResult(raw: string, logger?: Logger): SceneSegment[] {
 
     return scenes;
   } catch (err) {
+    // Rethrow typed parse failures unchanged; convert anything else
+    // (typically a JSON.parse SyntaxError) into the typed error so callers
+    // never see an indistinguishable [] for a broken extraction.
+    if (err instanceof ExtractionParseError) {
+      throw err;
+    }
     logger?.warn?.(`${TAG} Failed to parse extraction result: ${err instanceof Error ? err.message : String(err)}`);
-    return [];
+    throw new ExtractionParseError("invalid_json", raw, err);
   }
 }
 
@@ -525,4 +695,46 @@ function normalizeType(raw: string): MemoryType | null {
   if (lower === "instruct") return "instruction";
   if (lower === "preference") return "persona"; // fold preference into persona
   return null;
+}
+
+/**
+ * Rank a memory into its prompt-defined priority band (higher = more
+ * precious, kept first when truncating).
+ *
+ * Bands follow src/core/prompts/l1-extraction.ts:
+ * - persona:    80-100 core trait · 50-70 general · <50 discardable
+ * - episodic:   80-100 important · 60-70 normal · <60 discardable
+ * - instruction: **-1 = strict global rule (the MOST precious memory there
+ *   is)** · 90-100 core rule · 70-80 important · <70 discardable
+ *
+ * The instruction -1 case is why a naive "sort by priority descending" would
+ * be wrong — the strict global rule sorts *lowest* numerically but must
+ * never be truncated away.
+ */
+function priorityBandRank(m: { type: MemoryType; priority: number }): number {
+  const p = m.priority;
+  if (m.type === "instruction" && p === -1) return 4; // strict global rule — always kept first
+  if (p >= 80) return 3;
+  if (m.type === "persona" && p >= 50) return 2;
+  if (m.type === "episodic" && p >= 60) return 2;
+  if (m.type === "instruction" && p >= 70) return 2;
+  return 1; // below the type's "discardable" floor
+}
+
+/**
+ * Within the same priority band, keep instructions before persona
+ * before episodic: a behavioural rule constrains every future turn, a
+ * persona trait colours them, an event is the most re-derivable.
+ */
+function typeRank(type: MemoryType): number {
+  switch (type) {
+    case "instruction":
+      return 0;
+    case "persona":
+      return 1;
+    case "episodic":
+      return 2;
+    default:
+      return 3;
+  }
 }

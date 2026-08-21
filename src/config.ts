@@ -93,6 +93,8 @@ export interface RecallConfig {
   strategy: "embedding" | "keyword" | "hybrid";
   /** Overall recall timeout in milliseconds (default: 5000). When exceeded, recall is skipped with a warning. */
   timeoutMs: number;
+  /** Combined per-turn call budget shared by the memory search tools (default: 3). Enforced in before_tool_call. */
+  memoryToolCallLimit: number;
 }
 
 /** Embedding service configuration for vector search. */
@@ -285,6 +287,17 @@ export interface OffloadConfig {
    * primary non-loopback IPv4 address.
    */
   userId?: string;
+  /**
+   * When true (default), L1-degraded fallback entries carry
+   * `score: null` (explicit unknown) instead of legacy `score: 0`, and are
+   * given their own explicit position in the mild-cascade ordering. Default: true.
+   */
+  l1DegradedUnknownScore: boolean;
+  /**
+   * Absolute cap on the degraded-entry retry pool per session; past
+   * the cap the oldest unknown is evicted (marked exhausted) first. Default: 10.
+   */
+  l1DegradedRetryPoolCap: number;
 }
 
 /** Fully resolved plugin configuration (v3). */
@@ -495,6 +508,8 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
     offloadRetentionDays: normalizeOffloadRetentionDays(num(offloadGroup, "offloadRetentionDays") ?? 0),
     logMaxSizeMb: num(offloadGroup, "logMaxSizeMb") ?? 50,
     userId: optStr(offloadGroup, "userId"),
+    l1DegradedUnknownScore: bool(offloadGroup, "l1DegradedUnknownScore") ?? true,
+    l1DegradedRetryPoolCap: num(offloadGroup, "l1DegradedRetryPoolCap") ?? 10,
   };
 
   return {
@@ -535,6 +550,7 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
       scoreThreshold: num(recallGroup, "scoreThreshold") ?? 0.3,
       strategy: validateStrategy(str(recallGroup, "strategy")) ?? "hybrid",
       timeoutMs: num(recallGroup, "timeoutMs") ?? 5000,
+      memoryToolCallLimit: num(recallGroup, "memoryToolCallLimit") ?? 3,
     },
     embedding: {
       enabled: embeddingEnabled,

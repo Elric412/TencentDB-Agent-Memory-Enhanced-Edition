@@ -21,6 +21,7 @@ import type { IMemoryStore, L1SearchResult, L1FtsResult } from "../store/types.j
 import { buildFtsQuery } from "../store/sqlite.js";
 import type { EmbeddingService, EmbeddingCallOptions } from "../store/embedding.js";
 import { sanitizeText } from "../../utils/sanitize.js";
+import { report } from "../report/reporter.js";
 import type { Logger } from "../types.js";
 
 const TAG = "[memory-tdai] [recall]";
@@ -67,6 +68,13 @@ export interface RecallResult {
   recalledL3Persona?: string | null;
   /** Effective search strategy used */
   recallStrategy?: string;
+  /**
+   * True when the recall returned empty because the deadline elapsed, NOT
+   * because the index held nothing relevant. A genuine miss and a slow index
+   * have completely different remedies, so they must not collapse onto one
+   * return value — hit rate and timeout rate are reported independently.
+   */
+  timedOut?: boolean;
 }
 
 export async function performAutoRecall(params: {
@@ -88,12 +96,21 @@ export async function performAutoRecall(params: {
     performAutoRecallInner(params).finally(() => {
       if (timer) clearTimeout(timer);
     }),
-    new Promise<undefined>((resolve) => {
+    new Promise<RecallResult>((resolve) => {
       timer = setTimeout(() => {
         logger?.warn?.(
           `${TAG} ⚠️ Recall timed out after ${timeoutMs}ms — skipping memory injection to avoid blocking the user`,
         );
-        resolve(undefined);
+        // A timeout is not a miss. "The index is too slow" and "the index
+        // does not contain what you need" have completely different remedies,
+        // so they get separate counters and a distinct return value — hit rate
+        // and timeout rate can then be reported as independent numbers.
+        report("recall_timeout", {
+          timeoutMs,
+          sessionKey: params.sessionKey,
+          userTextLength: params.userText?.length ?? 0,
+        });
+        resolve({ timedOut: true });
       }, timeoutMs);
     }),
   ]);

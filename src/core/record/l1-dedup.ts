@@ -23,6 +23,29 @@ import type { LLMRunner, Logger } from "../types.js";
 
 const TAG = "[memory-tdai][l1-dedup]";
 
+/**
+ * Thrown when the dedup LLM judgment cannot be completed (LLM call
+ * failed, or its output could not be parsed into usable decisions). Before
+ * this change, every such failure collapsed into `fallbackStoreAll`, which
+ * stored every candidate as a verified record — silently writing duplicates
+ * into the live corpus. The typed error lets the caller quarantine the batch
+ * instead of pretending the dedup succeeded.
+ */
+export class DedupFailureError extends Error {
+  /** Machine-readable failure reason. */
+  readonly reason: "no_json_array" | "not_an_array" | "invalid_json" | "llm_call_failed";
+  /** Number of memories in the batch that failed to be judged. */
+  readonly batchSize: number;
+
+  constructor(reason: DedupFailureError["reason"], batchSize: number, cause?: unknown) {
+    super(`L1 dedup judgment failed (${reason}): batchSize=${batchSize}${cause instanceof Error ? `, cause=${cause.message}` : ""}`);
+    this.name = "DedupFailureError";
+    this.reason = reason;
+    this.batchSize = batchSize;
+    if (cause !== undefined) this.cause = cause;
+  }
+}
+
 // ============================
 // Core function (batch mode)
 // ============================
@@ -180,14 +203,17 @@ async function runLlmJudgment(
     const decisions = parseBatchResult(result, memories, logger);
     return decisions;
   } catch (err) {
+    // Do NOT default all to store. Propagate a typed failure so the
+    // caller can quarantine the batch instead of silently committing
+    // unverified duplicates to the live corpus.
+    if (err instanceof DedupFailureError) {
+      logger?.warn?.(`${TAG} Batch conflict detection failed: ${err.message}`);
+      throw err;
+    }
     logger?.warn?.(
-      `${TAG} Batch conflict detection failed, defaulting all to store: ${err instanceof Error ? err.message : String(err)}`,
+      `${TAG} Batch conflict detection LLM call failed: ${err instanceof Error ? err.message : String(err)}`,
     );
-    return memories.map((m) => ({
-      record_id: m.record_id,
-      action: "store" as const,
-      target_ids: [],
-    }));
+    throw new DedupFailureError("llm_call_failed", memories.length, err);
   }
 }
 
@@ -323,7 +349,7 @@ function parseBatchResult(
     const arrayMatch = cleaned.match(/\[[\s\S]*\]/);
     if (!arrayMatch) {
       logger?.warn?.(`${TAG} No JSON array found in conflict detection response`);
-      return fallbackStoreAll(memories);
+      throw new DedupFailureError("no_json_array", memories.length);
     }
 
     // Sanitize control characters inside JSON string literals that LLM may produce
@@ -332,7 +358,7 @@ function parseBatchResult(
 
     if (!Array.isArray(parsed)) {
       logger?.warn?.(`${TAG} Conflict detection response is not an array`);
-      return fallbackStoreAll(memories);
+      throw new DedupFailureError("not_an_array", memories.length);
     }
 
     // Build decisions from LLM output
@@ -381,18 +407,13 @@ function parseBatchResult(
 
     return decisions;
   } catch (err) {
+    // Rethrow typed dedup failures unchanged; convert anything else
+    // (typically a JSON.parse SyntaxError) into the typed error so a failed
+    // judgment is never collapsed into "store everything as verified."
+    if (err instanceof DedupFailureError) {
+      throw err;
+    }
     logger?.warn?.(`${TAG} Failed to parse conflict detection result: ${err instanceof Error ? err.message : String(err)}`);
-    return fallbackStoreAll(memories);
+    throw new DedupFailureError("invalid_json", memories.length, err);
   }
-}
-
-/**
- * Fallback: store all memories when parsing fails.
- */
-function fallbackStoreAll(memories: Array<ExtractedMemory & { record_id: string }>): DedupDecision[] {
-  return memories.map((m) => ({
-    record_id: m.record_id,
-    action: "store" as const,
-    target_ids: [],
-  }));
 }
